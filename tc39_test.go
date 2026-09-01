@@ -204,38 +204,13 @@ var (
 		"test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-negative-cases.js":          true,
 		"test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js": true,
 
-		// JSON (rawJSON, reviver)
-		"test/built-ins/JSON/isRawJSON/not-a-constructor.js":                        true,
-		"test/built-ins/JSON/isRawJSON/length.js":                                   true,
-		"test/built-ins/JSON/isRawJSON/prop-desc.js":                                true,
-		"test/built-ins/JSON/isRawJSON/basic.js":                                    true,
-		"test/built-ins/JSON/isRawJSON/name.js":                                     true,
-		"test/built-ins/JSON/isRawJSON/builtin.js":                                  true,
+		// JSON (reviver)
+		"test/built-ins/JSON/rawJSON/bigint-raw-json-can-be-stringified.js":         true,
 		"test/built-ins/JSON/parse/reviver-forward-modifies-object.js":              true,
 		"test/built-ins/JSON/parse/reviver-context-source-primitive-literal.js":     true,
 		"test/built-ins/JSON/parse/reviver-context-source-object-literal.js":        true,
 		"test/built-ins/JSON/parse/reviver-context-source-array-literal.js":         true,
 		"test/built-ins/JSON/parse/reviver-call-args-after-forward-modification.js": true,
-
-		// Error.isError
-		"test/built-ins/Error/isError/symbols.js":                                   true,
-		"test/built-ins/Error/isError/primitives.js":                                true,
-		"test/built-ins/Error/isError/prop-desc.js":                                 true,
-		"test/built-ins/Error/isError/name.js":                                      true,
-		"test/built-ins/Error/isError/is-a-constructor.js":                          true,
-		"test/built-ins/Error/isError/fake-errors.js":                               true,
-		"test/built-ins/Error/isError/errors.js":                                    true,
-		"test/built-ins/Error/isError/non-error-objects.js":                         true,
-		"test/built-ins/Error/isError/error-subclass.js":                            true,
-		"test/built-ins/Error/isError/bigints.js":                                   true,
-		"test/built-ins/Error/error-message-tostring-symbol.js":                     true,
-		"test/built-ins/NativeErrors/nativeerror-tostring-message-throws-symbol.js": true,
-
-		// Object, Array, AggregateError
-		"test/built-ins/Object/prototype/setPrototypeOf-with-non-circular-values.js":           true,
-		"test/built-ins/Object/prototype/setPrototypeOf-with-non-circular-values-__proto__.js": true,
-		"test/built-ins/Array/prototype/flat/non-numeric-depth-should-not-throw.js":            true,
-		"test/built-ins/AggregateError/errors-iterabletolist.js":                               true,
 
 		// Language tests (class, with, module, expressions, identifiers)
 		"test/language/statements/class/subclass/private-class-field-on-nonextensible-return-override.js":                                   true,
@@ -266,6 +241,45 @@ var (
 		"test/language/literals/regexp/named-groups/invalid-duplicate-groupspecifier-2-u.js": true,
 
 		"test/language/literals/regexp/named-groups/invalid-identity-escape-in-capture-u.js": true,
+
+		// Uint8Array base64 methods (fromBase64/toBase64/setFromBase64) not implemented
+		"test/built-ins/Uint8Array/fromBase64/alphabet.js":                            true,
+		"test/built-ins/Uint8Array/fromBase64/descriptor.js":                          true,
+		"test/built-ins/Uint8Array/fromBase64/ignores-receiver.js":                    true,
+		"test/built-ins/Uint8Array/fromBase64/illegal-characters.js":                  true,
+		"test/built-ins/Uint8Array/fromBase64/last-chunk-handling.js":                 true,
+		"test/built-ins/Uint8Array/fromBase64/last-chunk-invalid.js":                  true,
+		"test/built-ins/Uint8Array/fromBase64/length.js":                              true,
+		"test/built-ins/Uint8Array/fromBase64/name.js":                                true,
+		"test/built-ins/Uint8Array/fromBase64/nonconstructor.js":                      true,
+		"test/built-ins/Uint8Array/fromBase64/option-coercion.js":                     true,
+		"test/built-ins/Uint8Array/fromBase64/results.js":                             true,
+		"test/built-ins/Uint8Array/fromBase64/whitespace.js":                          true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/alphabet.js":               true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/descriptor.js":             true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/detached-buffer.js":        true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/illegal-characters.js":     true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/last-chunk-handling.js":    true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/length.js":                 true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/name.js":                   true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/nonconstructor.js":         true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/option-coercion.js":        true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/results.js":                true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/subarray.js":               true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/target-size.js":            true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/trailing-garbage-empty.js": true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/trailing-garbage.js":       true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/whitespace.js":             true,
+		"test/built-ins/Uint8Array/prototype/setFromBase64/writes-up-to-error.js":     true,
+		"test/built-ins/Uint8Array/prototype/toBase64/alphabet.js":                    true,
+		"test/built-ins/Uint8Array/prototype/toBase64/descriptor.js":                  true,
+		"test/built-ins/Uint8Array/prototype/toBase64/detached-buffer.js":             true,
+		"test/built-ins/Uint8Array/prototype/toBase64/length.js":                      true,
+		"test/built-ins/Uint8Array/prototype/toBase64/name.js":                        true,
+		"test/built-ins/Uint8Array/prototype/toBase64/nonconstructor.js":              true,
+		"test/built-ins/Uint8Array/prototype/toBase64/omit-padding.js":                true,
+		"test/built-ins/Uint8Array/prototype/toBase64/option-coercion.js":             true,
+		"test/built-ins/Uint8Array/prototype/toBase64/results.js":                     true,
 	}
 
 	featuresBlackList = []string{
@@ -301,7 +315,6 @@ var (
 		"regexp-v-flag",
 		"iterator-helpers",
 		"symbols-as-weakmap-keys",
-		"uint8array-base64",
 		"String.prototype.toWellFormed",
 		"explicit-resource-management",
 		"set-methods",
@@ -394,9 +407,6 @@ func init() {
 		// Map getOrInsert*
 		"test/built-ins/WeakMap/prototype/getOrInsert",
 		"test/built-ins/Map/prototype/getOrInsert",
-
-		// rawJSON isn not supported
-		"test/built-ins/JSON/rawJSON",
 	)
 
 }
