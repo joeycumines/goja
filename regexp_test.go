@@ -14,6 +14,26 @@ func TestRegexp1(t *testing.T) {
 	testScript(SCRIPT, valueTrue, t)
 }
 
+func TestRegexpInvalidUnicodeControlEscapes(t *testing.T) {
+	const SCRIPT = `
+	["u", "iu"].forEach(function (flags) {
+		["", "0", "9", "_", "%", "й"].forEach(function (c) {
+			["\\c" + c, "[\\c" + c + "]"].forEach(function (pattern) {
+				try {
+					new RegExp(pattern, flags);
+				} catch (e) {
+					if (e instanceof SyntaxError) return;
+					throw e;
+				}
+				throw new Error("Expected SyntaxError: " + pattern);
+			});
+		});
+	});
+	/\cA/u.test("\x01") && /[\cz]/iu.test("\x1a");
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
 func TestRegexp2(t *testing.T) {
 	const SCRIPT = `
 	var r = new RegExp("(['\"])(.*?)['\"]");
@@ -156,6 +176,32 @@ func TestRegexpSInClass(t *testing.T) {
 	/[\S]/.test("\u2028");
 	`
 	testScript(SCRIPT, valueFalse, t)
+}
+
+func TestRegexpDashAfterClassEscape(t *testing.T) {
+	const SCRIPT = `
+	var toCamelCase = function(s) {
+		return s.replace(/^([A-Z])|[\s-_]+(\w)/g, function(m, p1, p2) {
+			return p2 ? p2.toUpperCase() : p1.toLowerCase();
+		});
+	};
+	toCamelCase("Foo bar-baz_qux");
+	`
+
+	testScript(SCRIPT, asciiString("fooBarBazQux"), t)
+}
+
+func TestRegexpDashNextToClassEscape(t *testing.T) {
+	const SCRIPT = `
+	/^[\s-_]$/.test("-") && /^[\s-_]$/.test("_") && /^[\s-_]$/.test(" ") && !/^[\s-_]$/.test("a") &&
+	/^[_-\s]$/.test("-") && /^[\s-\d]$/.test("-") && /^[\d-_]$/.test("-") &&
+	/^[a-z]$/.test("m") && !/^[a-z]$/.test("-") &&
+	/^[\s\-_]$/.test("-") && /^[\s\-_]$/.test(" ") &&
+	/^[\b-_]$/.test("Z") && !/^[\b-_]$/.test("a") &&
+	/^[\s-_-a]$/.test("a") && !/^[\s-_-a]$/.test("\u0060");
+	`
+
+	testScript(SCRIPT, valueTrue, t)
 }
 
 func TestRegexpDotMatchCR(t *testing.T) {

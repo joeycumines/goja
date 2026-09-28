@@ -107,7 +107,6 @@ var (
 		"test/built-ins/RegExp/unicode_restricted_incomplete_quantifier.js":          true,
 		"test/built-ins/RegExp/unicode_restricted_identity_escape_x.js":              true,
 		"test/built-ins/RegExp/unicode_restricted_identity_escape_u.js":              true,
-		"test/built-ins/RegExp/unicode_restricted_identity_escape_c.js":              true,
 		"test/built-ins/RegExp/unicode_restricted_identity_escape_alpha.js":          true,
 		"test/built-ins/RegExp/unicode_restricted_identity_escape.js":                true,
 		"test/built-ins/RegExp/unicode_restricted_brackets.js":                       true,
@@ -204,38 +203,13 @@ var (
 		"test/built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-negative-cases.js":          true,
 		"test/built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js": true,
 
-		// JSON (rawJSON, reviver)
-		"test/built-ins/JSON/isRawJSON/not-a-constructor.js":                        true,
-		"test/built-ins/JSON/isRawJSON/length.js":                                   true,
-		"test/built-ins/JSON/isRawJSON/prop-desc.js":                                true,
-		"test/built-ins/JSON/isRawJSON/basic.js":                                    true,
-		"test/built-ins/JSON/isRawJSON/name.js":                                     true,
-		"test/built-ins/JSON/isRawJSON/builtin.js":                                  true,
+		// JSON (reviver)
+		"test/built-ins/JSON/rawJSON/bigint-raw-json-can-be-stringified.js":         true,
 		"test/built-ins/JSON/parse/reviver-forward-modifies-object.js":              true,
 		"test/built-ins/JSON/parse/reviver-context-source-primitive-literal.js":     true,
 		"test/built-ins/JSON/parse/reviver-context-source-object-literal.js":        true,
 		"test/built-ins/JSON/parse/reviver-context-source-array-literal.js":         true,
 		"test/built-ins/JSON/parse/reviver-call-args-after-forward-modification.js": true,
-
-		// Error.isError
-		"test/built-ins/Error/isError/symbols.js":                                   true,
-		"test/built-ins/Error/isError/primitives.js":                                true,
-		"test/built-ins/Error/isError/prop-desc.js":                                 true,
-		"test/built-ins/Error/isError/name.js":                                      true,
-		"test/built-ins/Error/isError/is-a-constructor.js":                          true,
-		"test/built-ins/Error/isError/fake-errors.js":                               true,
-		"test/built-ins/Error/isError/errors.js":                                    true,
-		"test/built-ins/Error/isError/non-error-objects.js":                         true,
-		"test/built-ins/Error/isError/error-subclass.js":                            true,
-		"test/built-ins/Error/isError/bigints.js":                                   true,
-		"test/built-ins/Error/error-message-tostring-symbol.js":                     true,
-		"test/built-ins/NativeErrors/nativeerror-tostring-message-throws-symbol.js": true,
-
-		// Object, Array, AggregateError
-		"test/built-ins/Object/prototype/setPrototypeOf-with-non-circular-values.js":           true,
-		"test/built-ins/Object/prototype/setPrototypeOf-with-non-circular-values-__proto__.js": true,
-		"test/built-ins/Array/prototype/flat/non-numeric-depth-should-not-throw.js":            true,
-		"test/built-ins/AggregateError/errors-iterabletolist.js":                               true,
 
 		// Language tests (class, with, module, expressions, identifiers)
 		"test/language/statements/class/subclass/private-class-field-on-nonextensible-return-override.js":                                   true,
@@ -301,10 +275,8 @@ var (
 		"regexp-v-flag",
 		"iterator-helpers",
 		"symbols-as-weakmap-keys",
-		"uint8array-base64",
 		"String.prototype.toWellFormed",
 		"explicit-resource-management",
-		"set-methods",
 		"promise-try",
 		"promise-with-resolvers",
 		"array-grouping",
@@ -394,9 +366,6 @@ func init() {
 		// Map getOrInsert*
 		"test/built-ins/WeakMap/prototype/getOrInsert",
 		"test/built-ins/Map/prototype/getOrInsert",
-
-		// rawJSON isn not supported
-		"test/built-ins/JSON/rawJSON",
 	)
 
 }
