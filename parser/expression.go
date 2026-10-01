@@ -668,6 +668,8 @@ func (self *_parser) parseDotMember(left ast.Expression) ast.Expression {
 		return &ast.BadExpression{From: period, To: self.idx}
 	}
 
+	// A member IdentifierName can end an expression even when lexed as a keyword.
+	self.insertSemicolon = true
 	self.next()
 
 	return &ast.DotExpression{
@@ -702,6 +704,7 @@ func (self *_parser) parseNewExpression() ast.Expression {
 					Idx:  idx,
 				},
 				Property: self.parseIdentifier(),
+				Idx:      idx,
 			}
 		}
 		self.errorUnexpectedToken(token.IDENTIFIER)
@@ -1197,7 +1200,10 @@ func (self *_parser) parseArrowFunction(start file.Idx, paramList *ast.Parameter
 		Async:         async,
 	}
 	node.Body, node.DeclarationList = self.parseArrowFunctionBody(async)
-	node.Source = self.slice(start, node.Body.Idx1())
+	// Use the end of the last consumed token rather than node.Body.Idx1(): a parenthesised
+	// concise body (e.g. `() => ({})`) does not include the closing parenthesis.
+	node.End = self.prevTokenEnd
+	node.Source = self.slice(start, node.End)
 	return node
 }
 
@@ -1415,6 +1421,9 @@ func (self *_parser) parseExpression() ast.Expression {
 }
 
 func (self *_parser) checkComma(from, to file.Idx) {
+	if from >= to {
+		return
+	}
 	if pos := strings.IndexByte(self.str[int(from)-self.base:int(to)-self.base], ','); pos >= 0 {
 		self.error(from+file.Idx(pos), "Comma is not allowed here")
 	}

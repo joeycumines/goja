@@ -504,6 +504,8 @@ func TestParserErr(t *testing.T) {
 		test(`var{..(`, "(anonymous): Line 1:7 Unexpected token ILLEGAL")
 		test(`var{get..(`, "(anonymous): Line 1:10 Unexpected token ILLEGAL")
 		test(`var{set..(`, "(anonymous): Line 1:10 Unexpected token ILLEGAL")
+		test(`const [...[`, "(anonymous): Line 1:12 Unexpected end of input")
+		test(`const {a: [...[}`, "(anonymous): Line 1:16 Unexpected token }")
 		test(`(0 ?? 0 || true)`, "(anonymous): Line 1:9 Logical expressions and coalesce expressions cannot be mixed. Wrap either by parentheses")
 		test(`(a || b ?? c)`, "(anonymous): Line 1:9 Logical expressions and coalesce expressions cannot be mixed. Wrap either by parentheses")
 		test(`2 ?? 2 && 3 + 3`, "(anonymous): Line 1:3 Logical expressions and coalesce expressions cannot be mixed. Wrap either by parentheses")
@@ -1133,6 +1135,19 @@ func TestPosition(t *testing.T) {
 		node = program.Body[0].(*ast.ExpressionStatement).Expression.(*ast.UnaryExpression)
 		is(parser.slice(node.Idx0(), node.Idx1()), "++a")
 
+		parser = newParser("", "f(() => (({ a: 1 })), 1)")
+		program, err = parser.parse()
+		is(err, nil)
+		node = program.Body[0].(*ast.ExpressionStatement).Expression.(*ast.CallExpression).ArgumentList[0].(*ast.ArrowFunctionLiteral)
+		is(parser.slice(node.Idx0(), node.Idx1()), "() => (({ a: 1 }))")
+		is(node.(*ast.ArrowFunctionLiteral).Source, "() => (({ a: 1 }))")
+
+		parser = newParser("", "(x => { return x; })")
+		program, err = parser.parse()
+		is(err, nil)
+		node = program.Body[0].(*ast.ExpressionStatement).Expression.(*ast.ArrowFunctionLiteral)
+		is(parser.slice(node.Idx0(), node.Idx1()), "x => { return x; }")
+
 		parser = newParser("", "xyz: for (i = 0; i < 10; i++) { if (i == 5) continue xyz; }")
 		program, err = parser.parse()
 		is(err, nil)
@@ -1183,6 +1198,18 @@ func TestPosition(t *testing.T) {
 	case 2:
 	default: x++;
 }`)
+
+		parser = newParser("", "x;\nif (a) b(); else c()")
+		program, err = parser.parse()
+		is(err, nil)
+		node = program.Body[1].(*ast.IfStatement)
+		is(parser.slice(node.Idx0(), node.Idx1()), "if (a) b(); else c()")
+
+		parser = newParser("", "function f() { return new.target }")
+		program, err = parser.parse()
+		is(err, nil)
+		node = program.Body[0].(*ast.FunctionDeclaration).Function.Body.List[0].(*ast.ReturnStatement).Argument.(*ast.MetaProperty)
+		is(parser.slice(node.Idx0(), node.Idx1()), "new.target")
 	})
 }
 

@@ -3,6 +3,7 @@ package goja
 import "github.com/joeycumines/goja/unistring"
 
 var (
+	SymAsyncIterator      = newSymbol(asciiString("Symbol.asyncIterator"))
 	SymHasInstance        = newSymbol(asciiString("Symbol.hasInstance"))
 	SymIsConcatSpreadable = newSymbol(asciiString("Symbol.isConcatSpreadable"))
 	SymIterator           = newSymbol(asciiString("Symbol.iterator"))
@@ -136,6 +137,7 @@ func (r *Runtime) createSymbol(val *Object) objectImpl {
 	o._putProp("keyFor", r.newNativeFunc(r.symbol_keyfor, "keyFor", 1), true, false, true)
 
 	for _, s := range []*Symbol{
+		SymAsyncIterator,
 		SymHasInstance,
 		SymIsConcatSpreadable,
 		SymIterator,

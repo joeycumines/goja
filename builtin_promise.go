@@ -3,7 +3,11 @@ package goja
 import (
 	"reflect"
 
+<<<<<<< HEAD
 	"github.com/joeycumines/goja/unistring"
+=======
+	"github.com/dop251/goja/unistring"
+>>>>>>> upstream/master
 )
 
 type PromiseState int
@@ -417,9 +421,11 @@ func (r *Runtime) promiseProto_catch(call FunctionCall) Value {
 
 func (r *Runtime) promiseResolve(c *Object, x Value) *Object {
 	if obj, ok := x.(*Object); ok {
-		xConstructor := nilSafe(obj.self.getStr("constructor", nil))
-		if xConstructor.SameAs(c) {
-			return obj
+		if _, ok := obj.self.(*Promise); ok {
+			xConstructor := nilSafe(obj.self.getStr("constructor", nil))
+			if xConstructor.SameAs(c) {
+				return obj
+			}
 		}
 	}
 	pcap := r.newPromiseCapability(c)
@@ -578,9 +584,7 @@ func (r *Runtime) promise_any(call FunctionCall) Value {
 				errors[index] = call.Argument(0)
 				remainingElementsCount--
 				if remainingElementsCount == 0 {
-					_error := r.builtin_new(r.getAggregateError(), nil)
-					_error.self._putProp("errors", r.newArrayValues(errors), true, false, true)
-					pcap.reject(_error)
+					pcap.reject(r.newAggregateErrorErrors(errors))
 				}
 				return _undefined
 			}, "", 1)
@@ -590,9 +594,7 @@ func (r *Runtime) promise_any(call FunctionCall) Value {
 		})
 		remainingElementsCount--
 		if remainingElementsCount == 0 {
-			_error := r.builtin_new(r.getAggregateError(), nil)
-			_error.self._putProp("errors", r.newArrayValues(errors), true, false, true)
-			pcap.reject(_error)
+			pcap.reject(r.newAggregateErrorErrors(errors))
 		}
 	})
 	return pcap.promise
