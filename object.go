@@ -26,9 +26,12 @@ const (
 	classRegExp        = "RegExp"
 	classDate          = "Date"
 	classJSON          = "JSON"
+	classRawJSON       = "RawJSON"
 	classGlobal        = "global"
 	classPromise       = "Promise"
 
+	classIterator             = "Iterator"
+	classIteratorHelper       = "Iterator Helper"
 	classArrayIterator        = "Array Iterator"
 	classMapIterator          = "Map Iterator"
 	classSetIterator          = "Set Iterator"
@@ -48,6 +51,11 @@ var (
 type Object struct {
 	self    objectImpl
 	runtime *Runtime
+
+	// As Go does not have ephemerons, the only way to ensure the correct WeakMap semantics is to make the
+	// value reachable only through the key. This unfortunately bumps the size of Object from 24 to 32 bytes,
+	// but I could not find a better alternative.
+	weakMapRefs *weakMapRefs
 }
 
 type iterNextFunc func() (propIterItem, iterNextFunc)
@@ -472,6 +480,12 @@ func (o *baseObject) setProto(proto *Object, throw bool) bool {
 	current := o.prototype
 	if current.SameAs(proto) {
 		return true
+	}
+	// 10.4.7 Immutable Prototype Exotic Objects
+	// Object.prototype seems like the only immutable prototype exotic object
+	if o.val == o.val.runtime.global.ObjectPrototype {
+		o.val.runtime.typeErrorResult(throw, "Immutable prototype object 'Object.prototype' cannot have their prototype set")
+		return false
 	}
 	if !o.extensible {
 		o.val.runtime.typeErrorResult(throw, "%s is not extensible", o.val)
@@ -1640,6 +1654,13 @@ func (o *Object) defineOwnProperty(n Value, desc PropertyDescriptor, throw bool)
 	default:
 		return o.self.defineOwnPropertyStr(n.string(), desc, throw)
 	}
+}
+
+func (o *Object) getWeakMapRefs(create bool) *weakMapRefs {
+	if o.weakMapRefs == nil && create {
+		o.weakMapRefs = newWeakMapRefs()
+	}
+	return o.weakMapRefs
 }
 
 func (o *guardedObject) guard(props ...unistring.String) {

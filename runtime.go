@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/ast"
 	"hash/maphash"
+	"iter"
 	"math"
 	"math/big"
 	"math/bits"
@@ -124,7 +125,10 @@ type global struct {
 
 	AsyncFunctionPrototype *Object
 
+	Iterator                      *Object
 	IteratorPrototype             *Object
+	IteratorHelperPrototype       *Object
+	WrapForValidIteratorPrototype *Object
 	ArrayIteratorPrototype        *Object
 	MapIteratorPrototype          *Object
 	SetIteratorPrototype          *Object
@@ -143,6 +147,8 @@ type global struct {
 	weakMapAdder  *Object
 	mapAdder      *Object
 	setAdder      *Object
+	setHas        *Object
+	setValues     *Object
 	arrayValues   *Object
 	arrayToString *Object
 
@@ -441,6 +447,7 @@ func (r *Runtime) createIterProto(val *Object) objectImpl {
 	o := newBaseObjectObj(val, r.global.ObjectPrototype, classObject)
 
 	o._putSym(SymIterator, valueProp(r.newNativeFunc(r.returnThis, "[Symbol.iterator]", 0), true, false, true))
+	r.addIteratorHelpers(o)
 	return o
 }
 
@@ -492,7 +499,7 @@ func (r *Runtime) newReferenceError(name unistring.String) Value {
 	return r.newErrorf(r.getReferenceError(), "%s is not defined", name)
 }
 
-func (r *Runtime) newSyntaxError(msg string, offset int) Value {
+func (r *Runtime) newSyntaxError(msg string) Value {
 	return r.builtin_new(r.getSyntaxError(), []Value{newStringValue(msg)})
 }
 
@@ -788,6 +795,9 @@ func (r *Runtime) newWrappedFunc(value reflect.Value) *Object {
 	v.self = f
 	name := unistring.NewFromString(runtime.FuncForPC(value.Pointer()).Name())
 	f.init(name, intToValue(int64(value.Type().NumIn())))
+	if iter := r.getGoFuncIterator(value); iter != nil {
+		f._putSym(SymIterator, valueProp(r.newNativeFunc(iter, "[Symbol.iterator]", 0), true, false, true))
+	}
 	return v
 }
 
@@ -1714,6 +1724,13 @@ converted into a JS exception. If the error is *Exception, it is thrown as is, o
 Note that if there are exactly two return values and the last is an `error`, the function returns the first value as is,
 not an Array.
 
+Iterator functions (https://pkg.go.dev/iter) have Symbol.iterator property and therefore can be iterated over using
+for-of loops. Both single-value and 2-value iterators are supported. In case of 2-value iterators the yielded value
+is a 2-element array, unless the second value's type is `error`. If the second value is error, and the iterator yields
+a non-nil value for it, it is thrown as an exception (and iteration stops), otherwise a single value is yielded.
+
+See ExampleRuntime_ToValue_seq, ExampleRuntime_ToValue_seq2 and ExampleRuntime_ToValue_seq2err.
+
 # Structs
 
 Structs are converted to Object-like values. Fields and methods are available as properties, their values are
@@ -1929,6 +1946,9 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 
 	switch value.Kind() {
 	case reflect.Map:
+		if value.IsNil() {
+			return _null
+		}
 		if value.Type().NumMethod() == 0 {
 			switch value.Type().Key().Kind() {
 			case reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -1982,6 +2002,9 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 		obj.self = a
 		return obj
 	case reflect.Func:
+		if value.IsNil() {
+			return _null
+		}
 		return r.newWrappedFunc(value)
 	}
 
@@ -2797,30 +2820,152 @@ type iteratorRecord struct {
 	next     func(FunctionCall) Value
 }
 
+func (r *Runtime) wrapIterSeq(nextFunc reflect.Value) (func(FunctionCall) Value, func()) {
+	n, stop := iter.Pull(nextFunc.Seq())
+	return func(FunctionCall) Value {
+		val, valid := n()
+		if !valid {
+			return r.createIterResultObject(_undefined, true)
+		}
+		return r.createIterResultObject(r.toValue(val.Interface(), val), false)
+	}, stop
+}
+
+func (r *Runtime) wrapIterSeq2(nextFunc reflect.Value) (func(FunctionCall) Value, func()) {
+	n, stop := iter.Pull2(nextFunc.Seq2())
+	if nextFunc.Type().In(0).In(1) == reflectTypeError {
+		return func(functionCall FunctionCall) Value {
+			val, errVal, valid := n()
+			if !valid {
+				return r.createIterResultObject(_undefined, true)
+			}
+			if !errVal.IsNil() {
+				stop()
+				err := errVal.Interface().(error)
+				if _, ok := err.(*Exception); ok {
+					panic(err)
+				}
+				if isUncatchableException(err) {
+					panic(err)
+				}
+				panic(r.NewGoError(err))
+			}
+			return r.createIterResultObject(r.toValue(val.Interface(), val), false)
+		}, stop
+	}
+
+	return func(FunctionCall) Value {
+		val1, val2, valid := n()
+		if !valid {
+			return r.createIterResultObject(_undefined, true)
+		}
+		return r.createIterResultObject(r.newArrayValues([]Value{r.toValue(val1.Interface(), val1), r.toValue(val2.Interface(), val2)}), false)
+	}, stop
+}
+
+func (r *Runtime) newGoIter(next func(FunctionCall) Value, stop func()) *Object {
+	iterObj := r.NewObject()
+	iterObj.self.setOwnStr("next", r.ToValue(next), false)
+	if stop != nil {
+		iterObj.self.setOwnStr("return", r.ToValue(func(call FunctionCall) Value {
+			stop()
+			return r.createIterResultObject(call.Argument(0), true)
+		}), false)
+	}
+	return iterObj
+}
+
+func (r *Runtime) getGoFuncIterator(fn reflect.Value) func(FunctionCall) Value {
+	typ := fn.Type()
+	if typ.CanSeq() {
+		return func(FunctionCall) Value {
+			return r.newGoIter(r.wrapIterSeq(fn))
+		}
+	}
+	if typ.CanSeq2() {
+		return func(FunctionCall) Value {
+			return r.newGoIter(r.wrapIterSeq2(fn))
+		}
+	}
+	return nil
+}
+
 func (r *Runtime) getIterator(obj Value, method func(FunctionCall) Value) *iteratorRecord {
 	if method == nil {
 		method = toMethod(r.getV(obj, SymIterator))
-		if method == nil {
-			panic(r.NewTypeError("object is not iterable"))
+	}
+	if method != nil {
+		iter := r.toObject(method(FunctionCall{
+			This: obj,
+		}))
+
+		return r.getIteratorDirect(iter)
+	}
+
+	panic(r.NewTypeError("object is not iterable"))
+}
+
+func (r *Runtime) getAsyncIterator(obj Value) *iteratorRecord {
+	if method := toMethod(r.getV(obj, SymAsyncIterator)); method != nil {
+		return r.getIterator(obj, method)
+	}
+	return r.createAsyncFromSyncIterator(r.getIterator(obj, nil))
+}
+
+// createAsyncFromSyncIterator implements CreateAsyncFromSyncIterator. The iterator object is only accessible
+// by for-await, so it only needs a 'return' method, 'next' is stored in the record.
+func (r *Runtime) createAsyncFromSyncIterator(syncIter *iteratorRecord) *iteratorRecord {
+	// AsyncFromSyncIteratorContinuation. Closing the sync iterator on rejection ignores any errors from return().
+	continuation := func(result *Object, pcap *promiseCapability, closeOnRejection bool) {
+		done := iteratorComplete(result)
+		value := iteratorValue(result)
+		closeOnRejection = closeOnRejection && !done
+		var valueWrapper *Object
+		if ex := r.vm.try(func() {
+			valueWrapper = r.promiseResolve(r.getPromise(), value)
+		}); ex != nil {
+			if closeOnRejection {
+				_ = r.vm.try(syncIter.returnIter)
+			}
+			panic(ex)
 		}
-	}
-
-	iter := r.toObject(method(FunctionCall{
-		This: obj,
-	}))
-
-	var next func(FunctionCall) Value
-
-	if obj, ok := iter.self.getStr("next", nil).(*Object); ok {
-		if call, ok := obj.self.assertCallable(); ok {
-			next = call
+		onFulfilled := r.newNativeFunc(func(call FunctionCall) Value {
+			return r.createIterResultObject(call.Argument(0), done)
+		}, "", 1)
+		var onRejected Value = _undefined
+		if closeOnRejection {
+			onRejected = r.newNativeFunc(func(call FunctionCall) Value {
+				_ = r.vm.try(syncIter.returnIter)
+				panic(call.Argument(0))
+			}, "", 1)
 		}
+		r.performPromiseThen(valueWrapper.self.(*Promise), onFulfilled, onRejected, pcap)
 	}
 
-	return &iteratorRecord{
-		iterator: iter,
-		next:     next,
+	next := func(FunctionCall) Value {
+		pcap := r.newPromiseCapability(r.getPromise())
+		pcap.try(func() {
+			if syncIter.next == nil {
+				panic(r.NewTypeError("iterator.next is not a function"))
+			}
+			continuation(r.toObject(syncIter.next(FunctionCall{This: syncIter.iterator})), pcap, true)
+		})
+		return pcap.promise
 	}
+	ret := func(FunctionCall) Value {
+		pcap := r.newPromiseCapability(r.getPromise())
+		pcap.try(func() {
+			if method := toMethod(syncIter.iterator.self.getStr("return", nil)); method != nil {
+				continuation(r.toObject(method(FunctionCall{This: syncIter.iterator})), pcap, false)
+			} else {
+				pcap.resolve(r.createIterResultObject(_undefined, true))
+			}
+		})
+		return pcap.promise
+	}
+	iter := r.NewObject()
+	iter.self._putProp("return", r.newNativeFunc(ret, "return", 0), true, false, true)
+	return &iteratorRecord{iterator: iter, next: next}
 }
 
 func iteratorComplete(iterResult *Object) bool {
@@ -2891,7 +3036,11 @@ func (ir *iteratorRecord) close() {
 // When using outside of Runtime.Run (i.e. when calling directly from Go code, not from a JS function implemented
 // in Go) it must be enclosed in Try. See the example.
 func (r *Runtime) ForOf(iterable Value, step func(curValue Value) (continueIteration bool)) {
-	iter := r.getIterator(iterable, nil)
+	r.forOfMethod(iterable, nil, step)
+}
+
+func (r *Runtime) forOfMethod(iterable Value, method func(FunctionCall) Value, step func(curValue Value) (continueIteration bool)) {
+	iter := r.getIterator(iterable, method)
 	for {
 		value, ex := iter.step()
 		if ex != nil {
