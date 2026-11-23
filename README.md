@@ -300,6 +300,23 @@ func TestInterrupt(t *testing.T) {
 }
 ```
 
+For terminal host cancellation, use `Runtime.Abort(cause)`. Unlike `Interrupt`,
+it permanently stops interpreted JavaScript: later execution cannot resume after
+an unwind or `ClearInterrupt`, and the first abort cause is retained. Native Go
+functions must still cooperate with cancellation. Go-only cleanup (such as
+rejecting a native promise) remains possible on the runtime owner; the host must
+also stop callback admission and join its native workers. Terminal native
+rejection schedules but never runs JavaScript reactions; jobs already handed to
+a `PromiseJobEnqueuer` remain host-owned and are rejected by `RunPromiseJob`
+with the abort cause.
+
+After terminal abort, the native rejection function returned by `NewPromise`
+can dispose of a still-pending result even if it has already adopted a thenable.
+It preserves completed results and does not change ordinary `Interrupt` behavior.
+`Promise.ObserveSettlement` lets a host observe actual fulfillment or rejection
+without adding a JavaScript reaction or marking a rejection as handled; its
+callback runs synchronously on the runtime owner and must not execute JavaScript.
+
 NodeJS Compatibility
 --------------------
 

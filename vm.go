@@ -379,6 +379,7 @@ type vm struct {
 	interrupted   uint32
 	interruptVal  interface{}
 	interruptLock sync.Mutex
+	aborted       bool // protected by interruptLock; irreversible once published
 
 	curAsyncRunner *asyncRunner
 
@@ -678,9 +679,28 @@ func (vm *vm) runWithProfiler() bool {
 
 func (vm *vm) Interrupt(v interface{}) {
 	vm.interruptLock.Lock()
-	vm.interruptVal = v
-	atomic.StoreUint32(&vm.interrupted, 1)
+	if !vm.aborted {
+		vm.interruptVal = v
+		atomic.StoreUint32(&vm.interrupted, 1)
+	}
 	vm.interruptLock.Unlock()
+}
+
+func (vm *vm) Abort(v interface{}) {
+	vm.interruptLock.Lock()
+	if !vm.aborted {
+		vm.aborted = true
+		vm.interruptVal = v
+		atomic.StoreUint32(&vm.interrupted, 1)
+	}
+	vm.interruptLock.Unlock()
+}
+
+func (vm *vm) isAborted() bool {
+	vm.interruptLock.Lock()
+	aborted := vm.aborted
+	vm.interruptLock.Unlock()
+	return aborted
 }
 
 func (vm *vm) checkInterrupt() {
@@ -694,22 +714,60 @@ func (vm *vm) throwInterrupt() {
 	v := &InterruptedError{
 		iface: vm.interruptVal,
 	}
-	v.stack = vm.captureStack(nil, 0)
 	vm.interruptLock.Unlock()
+	v.stack = vm.captureStack(nil, 0)
 	panic(v)
 }
 
 func (vm *vm) ClearInterrupt() {
-	atomic.StoreUint32(&vm.interrupted, 0)
+	vm.interruptLock.Lock()
+	if !vm.aborted {
+		atomic.StoreUint32(&vm.interrupted, 0)
+	}
+	vm.interruptLock.Unlock()
 }
 
 func getFuncName(stack []Value, sb int) unistring.String {
 	if sb > 0 {
-		if f, ok := stack[sb-1].(*Object); ok {
+		if f, ok := stack[sb-1].(*Object); ok && f != nil {
+			// Object-rest destructuring can leave an internal wrapper as the
+			// callee. Unwrap it before any property dispatch: forwarding
+			// getOwnPropStr through the wrapper can enter a proxy trap and
+			// invoke user code while capturing an interrupt stack.
+			for {
+				if f.self == nil {
+					return ""
+				}
+				d, wrapped := f.self.(*destructKeyedSource)
+				if !wrapped {
+					break
+				}
+				f, ok = d.wrapped.(*Object)
+				if !ok || f == nil {
+					return ""
+				}
+			}
 			if _, isProxy := f.self.(*proxyObject); isProxy {
 				return "proxy"
 			}
-			return nilSafe(f.self.getStr("name", nil)).string()
+			// Stack capture must never invoke user code, particularly while
+			// unwinding an interrupt. A name getter (or a coercion of its
+			// result) could recurse into the interrupted VM or never return.
+			name := f.self.getOwnPropStr("name")
+			if prop, ok := name.(*valueProperty); ok {
+				if prop.accessor {
+					return ""
+				}
+				name = prop.value
+			}
+			if name, ok := name.(String); ok {
+				return name.string()
+			}
+			if name != nil {
+				// Value implementations here are ordinary data values; no
+				// user-defined coercion runs during stack capture.
+				return name.string()
+			}
 		}
 	}
 	return ""

@@ -560,7 +560,9 @@ func (r *Runtime) NewTypeError(args ...interface{}) *Object {
 
 func (r *Runtime) NewGoError(err error) *Object {
 	e := r.newError(r.getGoError(), err.Error()).(*Object)
-	e.Set("value", err)
+	// Construct an own data property without consulting an inherited setter.
+	// Native error construction must remain safe during terminal cleanup.
+	e.self._putProp("value", r.ToValue(err), true, true, true)
 	return e
 }
 
@@ -1457,7 +1459,11 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
 				if len(vm.callStack) == 0 {
-					r.leaveAbrupt()
+					if r.vm.isAborted() {
+						r.leaveDiscardJobs()
+					} else {
+						r.leaveAbrupt()
+					}
 				}
 			} else {
 				panic(x)
@@ -1532,12 +1538,32 @@ func (r *Runtime) Interrupt(v interface{}) {
 	r.vm.Interrupt(v)
 }
 
+// Abort permanently interrupts JavaScript execution in this runtime. The
+// first Abort wins; neither Interrupt nor ClearInterrupt can replace its value
+// or make the runtime reusable. Interpreted execution that observes the abort
+// returns an *InterruptedError containing that value. Native Go functions are
+// not interrupted: the call that invokes Abort can still complete with its own
+// error, while current and subsequent interpreted execution remains terminal.
+// Abort is safe to call from another goroutine, including concurrently with
+// Interrupt or ClearInterrupt.
+//
+// Like Interrupt, Abort cannot interrupt native Go functions. Go-only operations
+// remain available to the runtime owner for cleanup, including rejecting native
+// promises; any JavaScript they invoke is still interrupted. Promise jobs may
+// still be forwarded to a configured PromiseJobEnqueuer, so a host must also
+// stop admitting callbacks and release its native work. Abort does not manage
+// an event loop, join goroutines, or cancel host-owned contexts.
+func (r *Runtime) Abort(v interface{}) {
+	r.vm.Abort(v)
+}
+
 // ClearInterrupt resets the interrupt flag. Typically this needs to be called before the runtime
 // is made available for re-use if there is a chance it could have been interrupted with Interrupt().
 // Otherwise if Interrupt() was called when runtime was not running (e.g. if it had already finished)
 // so that Interrupt() didn't actually trigger, an attempt to use the runtime will immediately cause
 // an interruption. It is up to the user to ensure proper synchronisation so that ClearInterrupt() is
 // only called when the runtime has finished and there is no chance of a concurrent Interrupt() call.
+// It has no effect after Abort.
 func (r *Runtime) ClearInterrupt() {
 	r.vm.ClearInterrupt()
 }
@@ -2930,6 +2956,18 @@ func (r *Runtime) getHash() *maphash.Hash {
 	return r.hash
 }
 
+// called after an uncatchable abort leaves the top-level Runtime call. Internal
+// jobs must not run; jobs already given to a host enqueuer are forwarded as in
+// leaveAbrupt, where RunPromiseJob rejects them with the abort cause.
+func (r *Runtime) leaveDiscardJobs() {
+	wasLeaving := r.leavingAbrupt
+	r.leavingAbrupt = true
+	defer func() {
+		r.leavingAbrupt = wasLeaving
+	}()
+	r.leaveAbrupt()
+}
+
 // called when the top level function returns normally (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
 	defer func() {
@@ -2937,6 +2975,12 @@ func (r *Runtime) leave() {
 		r.promiseJobQueuePriority = false
 		r.vm.stack = nil
 	}()
+	if r.vm.isAborted() {
+		if r.promiseJobEnqueuer != nil {
+			r.leaveAbrupt()
+		}
+		return
+	}
 	// Re-read the hook per job so mid-batch clearing or replacement
 	// takes effect immediately.
 	for len(r.jobQueue) > 0 {

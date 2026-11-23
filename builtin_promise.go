@@ -76,11 +76,12 @@ var typePromise = reflect.TypeOf((*Promise)(nil))
 // WARNING: Instances of Promise are not goroutine-safe. See Runtime.NewPromise() for more details.
 type Promise struct {
 	baseObject
-	state            PromiseState
-	result           Value
-	fulfillReactions []*promiseReaction
-	rejectReactions  []*promiseReaction
-	handled          bool
+	state               PromiseState
+	result              Value
+	fulfillReactions    []*promiseReaction
+	rejectReactions     []*promiseReaction
+	handled             bool
+	settlementObservers []func()
 }
 
 func (p *Promise) State() PromiseState {
@@ -89,6 +90,39 @@ func (p *Promise) State() PromiseState {
 
 func (p *Promise) Result() Value {
 	return p.result
+}
+
+// ObserveSettlement registers a native observer for this Promise's actual
+// fulfillment or rejection. Resolving to a pending thenable does not notify
+// observers until the adopted result settles. The callback runs synchronously
+// after State and Result have been published, after due JavaScript reactions
+// and rejection tracking are scheduled; an already-settled Promise calls it
+// immediately. Observers registered while the Promise is pending run in
+// registration order. Registration after settlement invokes immediately,
+// including when it happens from another observer. These callbacks do not add
+// JavaScript reactions or mark a rejection as handled.
+//
+// Like the Promise itself, this method is not goroutine-safe. The callback must
+// not execute JavaScript, panic, or call runtime.Goexit. A panic propagates and
+// prevents later observers from running, but cannot undo settlement; observer
+// references are cleared before any callback is invoked. A nil callback panics.
+func (p *Promise) ObserveSettlement(observer func()) {
+	if observer == nil {
+		panic("goja: nil Promise settlement observer")
+	}
+	if p.state != PromiseStatePending {
+		observer()
+		return
+	}
+	p.settlementObservers = append(p.settlementObservers, observer)
+}
+
+func (p *Promise) notifySettlement() {
+	observers := p.settlementObservers
+	p.settlementObservers = nil
+	for _, observer := range observers {
+		observer()
+	}
 }
 
 func (p *Promise) toValue(r *Runtime) Value {
@@ -106,7 +140,7 @@ func (p *Promise) createResolvingFunctions() (resolve, reject *Object) {
 	r := p.val.runtime
 	alreadyResolved := false
 	return p.val.runtime.newNativeFunc(func(call FunctionCall) Value {
-			if alreadyResolved {
+			if alreadyResolved || p.state != PromiseStatePending {
 				return _undefined
 			}
 			alreadyResolved = true
@@ -122,16 +156,25 @@ func (p *Promise) createResolvingFunctions() (resolve, reject *Object) {
 				if ex != nil {
 					return p.reject(ex.val)
 				}
+				// A native `then` getter can terminally settle the promise
+				// while this lookup runs; do not adopt an already-settled result.
+				if p.state != PromiseStatePending {
+					return _undefined
+				}
 				if call, ok := assertCallable(thenAction); ok {
 					job := r.newPromiseResolveThenableJob(p, resolution, &jobCallback{callback: call})
-					r.enqueuePromiseJob(job)
+					r.enqueuePromiseJob(func() {
+						if p.state == PromiseStatePending {
+							job()
+						}
+					})
 					return _undefined
 				}
 			}
 			return p.fulfill(resolution)
 		}, "", 1),
 		p.val.runtime.newNativeFunc(func(call FunctionCall) Value {
-			if alreadyResolved {
+			if alreadyResolved || p.state != PromiseStatePending {
 				return _undefined
 			}
 			alreadyResolved = true
@@ -141,6 +184,11 @@ func (p *Promise) createResolvingFunctions() (resolve, reject *Object) {
 }
 
 func (p *Promise) reject(reason Value) Value {
+	// A native host may dispose of an adopted Promise after Runtime.Abort.
+	// A resolving pair retained by that thenable must not replace the result.
+	if p.state != PromiseStatePending {
+		return _undefined
+	}
 	reactions := p.rejectReactions
 	p.result = reason
 	p.fulfillReactions, p.rejectReactions = nil, nil
@@ -150,15 +198,24 @@ func (p *Promise) reject(reason Value) Value {
 		r.trackPromiseRejection(p, PromiseRejectionReject)
 	}
 	r.triggerPromiseReactions(reactions, reason)
+	// Observers are notified last so a panic cannot strand settlement work
+	// that was already due when the Promise was settled.
+	p.notifySettlement()
 	return _undefined
 }
 
 func (p *Promise) fulfill(value Value) Value {
+	if p.state != PromiseStatePending {
+		return _undefined
+	}
 	reactions := p.fulfillReactions
 	p.result = value
 	p.fulfillReactions, p.rejectReactions = nil, nil
 	p.state = PromiseStateFulfilled
 	p.val.runtime.triggerPromiseReactions(reactions, value)
+	// Observers are notified last so a panic cannot strand reactions that
+	// were already due when the Promise was settled.
+	p.notifySettlement()
 	return _undefined
 }
 
@@ -197,6 +254,9 @@ func (p *Promise) addReactions(fulfillReaction *promiseReaction, rejectReaction 
 
 func (r *Runtime) newPromiseResolveThenableJob(p *Promise, thenable Value, then *jobCallback) func() {
 	return func() {
+		if p.state != PromiseStatePending {
+			return
+		}
 		resolve, reject := p.createResolvingFunctions()
 		ex := r.vm.try(func() {
 			r.callJobCallback(then, thenable, resolve, reject)
@@ -671,17 +731,51 @@ func (r *Runtime) getPromise() *Object {
 	return ret
 }
 
-func (r *Runtime) wrapPromiseReaction(fObj *Object) func(interface{}) error {
+func (r *Runtime) wrapPromiseReaction(p *Promise, fObj *Object, rejecting bool) func(interface{}) error {
 	f, _ := AssertFunction(fObj)
 	return func(x interface{}) error {
+		if rejecting && r.vm.isAborted() {
+			// JavaScript can no longer finish thenable adoption after an
+			// irreversible abort. Let the host dispose of the still-pending
+			// native Promise even if its resolving pair was already claimed.
+			// Completed results and ordinary Interrupt semantics are unchanged.
+			return r.rejectAbortedPromise(p, x)
+		}
 		_, err := f(nil, r.ToValue(x))
 		return err
 	}
 }
 
+// rejectAbortedPromise settles a still-pending native Promise after a terminal
+// abort without entering the VM or running queued jobs. A configured
+// PromiseJobEnqueuer still receives the resulting reaction jobs; the host owns
+// their execution and RunPromiseJob rejects them with the abort cause.
+func (r *Runtime) rejectAbortedPromise(p *Promise, x interface{}) (err error) {
+	if p.state != PromiseStatePending {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if ex := asUncatchableException(recovered); ex != nil {
+				err = ex
+			} else {
+				panic(recovered)
+			}
+		}
+	}()
+	p.reject(r.ToValue(x))
+	return nil
+}
+
 // NewPromise creates and returns a Promise and resolving functions for it.
 // The returned errors will be uncatchable errors, such as InterruptedError or StackOverflowError, which should be propagated upwards.
 // Exceptions are handled through [PromiseRejectionTracker].
+//
+// After [Runtime.Abort], reject can also reject a still-pending Promise whose
+// resolve function already adopted a thenable. This permits native terminal
+// cleanup when JavaScript can no longer complete that adoption. It never
+// changes an already fulfilled or rejected result. Ordinary [Runtime.Interrupt]
+// does not enable this terminal override.
 //
 // WARNING: The returned values are not goroutine-safe and must not be called in parallel with VM running.
 // In order to make use of this method you need an event loop such as the one in goja_nodejs (https://github.com/joeycumines/goja_nodejs)
@@ -704,7 +798,7 @@ func (r *Runtime) wrapPromiseReaction(fObj *Object) func(interface{}) error {
 func (r *Runtime) NewPromise() (promise *Promise, resolve, reject func(reason interface{}) error) {
 	p := r.newPromise(r.getPromisePrototype())
 	resolveF, rejectF := p.createResolvingFunctions()
-	return p, r.wrapPromiseReaction(resolveF), r.wrapPromiseReaction(rejectF)
+	return p, r.wrapPromiseReaction(p, resolveF, false), r.wrapPromiseReaction(p, rejectF, true)
 }
 
 // SetPromiseRejectionTracker registers a function that will be called in two scenarios: when a promise is rejected
