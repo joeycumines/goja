@@ -696,9 +696,10 @@ type asyncRunner struct {
 }
 
 func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
+	previousRunner := ar.gen.vm.curAsyncRunner
 	ar.gen.vm.curAsyncRunner = ar
 	defer func() {
-		ar.gen.vm.curAsyncRunner = nil
+		ar.gen.vm.curAsyncRunner = previousRunner
 	}()
 	arg := call.Argument(0)
 	res, resType, ex := ar.gen.next(arg)
@@ -707,9 +708,10 @@ func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
 }
 
 func (ar *asyncRunner) onRejected(call FunctionCall) Value {
+	previousRunner := ar.gen.vm.curAsyncRunner
 	ar.gen.vm.curAsyncRunner = ar
 	defer func() {
-		ar.gen.vm.curAsyncRunner = nil
+		ar.gen.vm.curAsyncRunner = previousRunner
 	}()
 	reason := call.Argument(0)
 	res, resType, ex := ar.gen.nextThrow(reason)
@@ -744,6 +746,9 @@ func (ar *asyncRunner) step(res Value, done bool, ex *Exception) {
 func (ar *asyncRunner) start(nArgs int) {
 	r := ar.f.runtime
 	ar.gen.vm = r.vm
+	frame := r.vm.saveExecutionFrame()
+	frame.sp -= nArgs + 2 // the call owns its callee, this, and arguments
+	defer ar.gen.restoreOnPanic(frame)
 	ar.promiseCap = r.newPromiseCapability(r.getPromise())
 	sp := r.vm.sp
 	ar.gen.enter()
@@ -765,6 +770,45 @@ type generator struct {
 	tryStackLen, iterStackLen, refStackLen uint32
 }
 
+// A Go execution boundary may own VM frames that have not been removed when a
+// nested call panics. Retain the caller's context and stack depths so its state
+// can be restored without running JavaScript cleanup or removing caller frames.
+type vmExecutionFrame struct {
+	context
+	sp                                                   int
+	callStackLen, tryStackLen, iterStackLen, refStackLen int
+}
+
+func (vm *vm) saveExecutionFrame() (frame vmExecutionFrame) {
+	vm.saveCtx(&frame.context)
+	frame.sp = vm.sp
+	frame.callStackLen, frame.tryStackLen = len(vm.callStack), len(vm.tryStack)
+	frame.iterStackLen, frame.refStackLen = len(vm.iterStack), len(vm.refStack)
+	return
+}
+
+func (vm *vm) restoreExecutionFrame(frame vmExecutionFrame) {
+	vm.discardStacks(uint32(frame.iterStackLen), uint32(frame.refStackLen))
+	clear(vm.tryStack[frame.tryStackLen:])
+	vm.tryStack = vm.tryStack[:frame.tryStackLen]
+	clear(vm.callStack[frame.callStackLen:])
+	vm.callStack = vm.callStack[:frame.callStackLen]
+	vm.restoreCtx(&frame.context)
+	vm.sp = frame.sp
+	vm.clearStack()
+}
+
+func (g *generator) restoreOnPanic(frame vmExecutionFrame) {
+	if x := recover(); x != nil {
+		// The VM's throw handler stops at the generator's own panic marker.
+		// Remove that marker and restore the caller before propagating it.
+		g.vm.restoreExecutionFrame(frame)
+		g.ctx = execCtx{}
+		g.returning = nil
+		panic(x)
+	}
+}
+
 func (g *generator) storeLengths() {
 	g.tryStackLen, g.iterStackLen, g.refStackLen = uint32(len(g.vm.tryStack)), uint32(len(g.vm.iterStack)), uint32(len(g.vm.refStack))
 }
@@ -781,7 +825,8 @@ func (g *generator) enterNextFinallyFrame() (canContinue bool) {
 	callStackLen := len(vm.callStack)
 
 	for len(vm.tryStack) > 0 {
-		tf := &vm.tryStack[len(vm.tryStack)-1]
+		frameIdx := len(vm.tryStack) - 1
+		tf := &vm.tryStack[frameIdx]
 		if int(tf.callStackLen) != callStackLen { // have we breached the function boundary?
 			break
 		}
@@ -790,6 +835,8 @@ func (g *generator) enterNextFinallyFrame() (canContinue bool) {
 			vm.throw(ex)
 			return true
 		}
+		// IteratorClose may run nested code and grow the try stack.
+		tf = &vm.tryStack[frameIdx]
 		if tf.finallyPos >= 0 {
 			vm.sp = int(tf.sp)
 			vm.stash = tf.stash
@@ -879,6 +926,7 @@ func (g *generator) enterNext() {
 }
 
 func (g *generator) next(v Value) (Value, resultType, *Exception) {
+	defer g.restoreOnPanic(g.vm.saveExecutionFrame())
 	g.enterNext()
 	if v != nil {
 		g.vm.push(v)
@@ -890,6 +938,7 @@ func (g *generator) next(v Value) (Value, resultType, *Exception) {
 }
 
 func (g *generator) nextThrow(v interface{}) (Value, resultType, *Exception) {
+	defer g.restoreOnPanic(g.vm.saveExecutionFrame())
 	g.enterNext()
 	ex := g.vm.handleThrow(v)
 	if ex != nil {
@@ -908,6 +957,9 @@ func (g *generatorObject) init(vmCall func(*vm, int), nArgs int) {
 	g.baseObject.init()
 	vm := g.val.runtime.vm
 	g.gen.vm = vm
+	frame := vm.saveExecutionFrame()
+	frame.sp -= nArgs + 2
+	defer g.gen.restoreOnPanic(frame)
 
 	g.gen.enter()
 	vmCall(vm, nArgs)
@@ -926,6 +978,16 @@ func (g *generatorObject) init(vmCall func(*vm, int), nArgs int) {
 func (g *generatorObject) validate() {
 	if g.state == genStateExecuting {
 		panic(g.val.runtime.NewTypeError("Illegal generator state"))
+	}
+}
+
+func (g *generatorObject) completeOnPanic() {
+	if x := recover(); x != nil {
+		g.state = genStateCompleted
+		g.delegated = nil
+		g.gen.ctx = execCtx{}
+		g.gen.returning = nil
+		panic(x)
 	}
 }
 
@@ -981,6 +1043,12 @@ func (g *generatorObject) tryCallDelegated(fn func() (Value, bool)) (ret Value, 
 }
 
 func (g *generatorObject) callDelegated(method func(FunctionCall) Value, v Value) (Value, bool) {
+	// A delegated native generator method can recurse after the delegating
+	// generator has suspended its interpreted frame. Keep a call frame here
+	// so such yield* chains are covered by the runtime's stack-depth limit.
+	vm := g.val.runtime.vm
+	vm.pushCtx()
+	defer vm.popCtx()
 	res := g.val.runtime.toObject(method(FunctionCall{This: g.delegated.iterator, Arguments: []Value{v}}))
 	if iteratorComplete(res) {
 		g.delegated = nil
@@ -991,6 +1059,7 @@ func (g *generatorObject) callDelegated(method func(FunctionCall) Value, v Value
 
 func (g *generatorObject) next(v Value) Value {
 	g.validate()
+	defer g.completeOnPanic()
 	if g.state == genStateCompleted {
 		return g.val.runtime.createIterResultObject(_undefined, true)
 	}
@@ -1013,6 +1082,7 @@ func (g *generatorObject) next(v Value) Value {
 
 func (g *generatorObject) throw(v Value) Value {
 	g.validate()
+	defer g.completeOnPanic()
 	if g.state == genStateSuspendedStart {
 		g.state = genStateCompleted
 	}
@@ -1044,6 +1114,7 @@ func (g *generatorObject) throw(v Value) Value {
 
 func (g *generatorObject) _return(v Value) Value {
 	g.validate()
+	defer g.completeOnPanic()
 	if g.state == genStateSuspendedStart {
 		g.state = genStateCompleted
 	}
@@ -1070,6 +1141,7 @@ func (g *generatorObject) _return(v Value) Value {
 
 	g.gen.returning = v
 	g.state = genStateExecuting
+	defer g.gen.restoreOnPanic(g.gen.vm.saveExecutionFrame())
 	g.gen.enterNext()
 	canContinue := g.gen.enterNextFinallyFrame()
 	if !canContinue {

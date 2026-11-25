@@ -202,6 +202,9 @@ type Runtime struct {
 	asyncContextTracker     AsyncContextTracker
 	promiseJobEnqueuer      PromiseJobEnqueuer
 	leavingAbrupt           bool
+	// abruptLeaves counts completed outermost abrupt cleanups. leave() uses it
+	// to notice a nested cleanup that finished while a hook was running.
+	abruptLeaves uint32
 	// asyncTrackerActive is true while a reaction job's tracker is between
 	// Resumed and Exited. enqueuePromiseJob buffers jobs instead of delivering
 	// them to a synchronous hook during this window.
@@ -421,13 +424,16 @@ func (e *Exception) Value() Value {
 	return e.val
 }
 
+// Unwrap returns the original Go error for an exception wrapping a value
+// created by Runtime.NewGoError. It does not inspect JavaScript properties or
+// prototypes, which may invoke user code even after Runtime.Abort.
 func (e *Exception) Unwrap() error {
-	if obj, ok := e.val.(*Object); ok {
-		if obj.runtime.getGoError().self.hasInstance(obj) {
-			if val := obj.Get("value"); val != nil {
-				e1, _ := val.Export().(error)
-				return e1
-			}
+	if e == nil {
+		return nil
+	}
+	if obj, ok := e.val.(*Object); ok && obj != nil {
+		if er, ok := obj.self.(*errorObject); ok {
+			return er.nativeError
 		}
 	}
 	return nil
@@ -560,6 +566,7 @@ func (r *Runtime) NewTypeError(args ...interface{}) *Object {
 
 func (r *Runtime) NewGoError(err error) *Object {
 	e := r.newError(r.getGoError(), err.Error()).(*Object)
+	e.self.(*errorObject).nativeError = err
 	// Construct an own data property without consulting an inherited setter.
 	// Native error construction must remain safe during terminal cleanup.
 	e.self._putProp("value", r.ToValue(err), true, true, true)
@@ -1447,25 +1454,24 @@ func asUncatchableException(v interface{}) error {
 // RunProgram executes a pre-compiled (see Compile()) code in the global context.
 func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	vm := r.vm
-	recursive := len(vm.callStack) > 0
+	frame := vm.saveExecutionFrame()
+	recursive := frame.callStackLen > 0
 	defer func() {
-		if recursive {
-			vm.sp -= 2
-			vm.popCtx()
-		} else {
-			vm.callStack = vm.callStack[:len(vm.callStack)-1]
-		}
-		if x := recover(); x != nil {
+		x := recover()
+		// This also covers a failed pushCtx and direct JavaScript entry
+		// from a forwarding hook after runTry has already returned.
+		vm.restoreExecutionFrame(frame)
+		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if len(vm.callStack) == 0 {
+				if !recursive {
 					r.leaveAbrupt()
 				}
 			} else {
-				if len(vm.callStack) == 0 {
-					vm.stack = nil
-					vm.prg = nil
-					vm.sb = -1
+				if !recursive {
+					// Catchable panics do not consume an interrupt the native
+					// code may have requested just before panicking.
+					r.leaveAbruptInternal(true)
 				}
 				panic(x)
 			}
@@ -2545,18 +2551,23 @@ func AssertConstructor(v Value) (Constructor, bool) {
 }
 
 func (r *Runtime) runWrapped(f func()) (err error) {
+	vm := r.vm
+	frame := vm.saveExecutionFrame()
+	recursive := frame.callStackLen > 0
 	defer func() {
-		if x := recover(); x != nil {
+		x := recover()
+		vm.restoreExecutionFrame(frame)
+		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if len(r.vm.callStack) == 0 {
+				if !recursive {
 					r.leaveAbrupt()
 				}
 			} else {
-				if len(r.vm.callStack) == 0 {
-					r.vm.stack = nil
-					r.vm.prg = nil
-					r.vm.sb = -1
+				if !recursive {
+					// Catchable panics do not consume an interrupt the native
+					// code may have requested just before panicking.
+					r.leaveAbruptInternal(true)
 				}
 				panic(x)
 			}
@@ -2566,7 +2577,7 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 	if ex != nil {
 		err = ex
 	}
-	if len(r.vm.callStack) == 0 {
+	if !recursive {
 		r.leave()
 	} else {
 		r.vm.clearStack()
@@ -2582,45 +2593,46 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 //
 // On success, if the hook is set, any jobs the job enqueued internally are
 // forwarded to the hook. If the hook is nil, they remain in r.jobQueue and run
-// on the next Run*() call. On an uncatchable error, leaveAbrupt() forwards
-// stranded jobs, clears the queue, and resets the interrupt flag.
+// on the next Run*() call. On an uncatchable error or a native panic, pending
+// jobs are forwarded to the hook without being executed, the internal queue
+// is cleared, and the ordinary interrupt flag is reset. The original error
+// or panic takes precedence over a panic from the hook during this cleanup.
 //
 // When called reentrantly (from within a running script) the outer operand
 // stack is preserved and leaveAbrupt() is not called. An InterruptedError
 // leaves the interrupt flag set for the outer script; a StackOverflowError is
 // cleared by handleThrow and the outer script can continue.
 func (r *Runtime) RunPromiseJob(job func()) (err error) {
-	recursive := len(r.vm.callStack) > 0
+	vm := r.vm
+	frame := vm.saveExecutionFrame()
+	recursive := frame.callStackLen > 0
 	if !recursive {
 		// Sentinel so nested RunProgram calls (e.g. a native handler
 		// calling r.RunString) are treated as recursive and do not
 		// drain the job queue via leave().
 		r.vm.callStack = append(r.vm.callStack, context{})
 	}
-	// Pop the sentinel before recover so a panicking hook does not
-	// leave it behind and poison future RunProgram calls.
+	// Trackers, capability resolution, and forwarding hooks can all enter
+	// JavaScript through direct Value APIs outside the handler's try frame.
+	// Restore the entire boundary before handling their panic, retaining its
+	// original value rather than converting a catchable panic into an error.
 	defer func() {
-		if !recursive {
-			r.vm.callStack = r.vm.callStack[:len(r.vm.callStack)-1]
-		}
-		if x := recover(); x != nil {
+		x := recover()
+		vm.restoreExecutionFrame(frame)
+		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if recursive {
-					r.vm.clearStack()
-				} else {
+				if !recursive {
 					r.leaveAbrupt()
 				}
 			} else {
-				if recursive {
-					r.vm.clearStack()
+				if !recursive {
+					// Catchable panics do not consume an interrupt the native
+					// code may have requested just before panicking.
+					r.leaveAbruptInternal(true)
 				}
 				panic(x)
 			}
-			return
-		}
-		if recursive {
-			r.vm.clearStack()
 		}
 	}()
 	r.vm.checkInterrupt()
@@ -2629,31 +2641,21 @@ func (r *Runtime) RunPromiseJob(job func()) (err error) {
 		r.vm.prg = nil
 		r.vm.sb = -1
 		r.vm.stack = nil
-	forward:
-		for len(r.jobQueue) > 0 {
-			jobs := r.jobQueue
-			r.jobQueue = nil
-			for i, job := range jobs {
-				// Re-read the hook per job so mid-batch clearing
-				// or replacement takes effect immediately.
-				hook := r.promiseJobEnqueuer
-				if hook == nil {
-					if r.vm.isAborted() {
-						r.jobQueue = nil
-						break forward
-					}
-					// Remaining jobs are older than anything
-					// the just-run job appended, so keep them
-					// ahead for the next Run*() call.
-					remaining := make([]func(), len(jobs[i:]))
-					copy(remaining, jobs[i:])
-					r.jobQueue = append(remaining, r.jobQueue...)
-					break forward
+		for len(r.jobQueue) > 0 && !r.leavingAbrupt {
+			// Keep unattempted jobs in the queue so a panicking hook cannot
+			// strand a detached batch. Later jobs remain behind this tail.
+			r.promiseJobQueuePriority = true
+			hook := r.promiseJobEnqueuer
+			if hook == nil {
+				if r.vm.isAborted() {
+					r.jobQueue = nil
 				}
-				hook(job)
+				break
 			}
+			hook(r.takePromiseJob())
 		}
-		if len(r.jobQueue) == 0 {
+		if len(r.jobQueue) == 0 && !r.leavingAbrupt {
+			r.jobQueue = nil
 			r.promiseJobQueuePriority = false
 		}
 	}
@@ -2980,108 +2982,118 @@ func (r *Runtime) getHash() *maphash.Hash {
 	return r.hash
 }
 
-// called when the top level function returns normally (i.e. control is passed outside the Runtime).
-func (r *Runtime) leave() {
-	finished := false
-	defer func() {
-		if finished || r.promiseJobEnqueuer == nil {
-			r.jobQueue = nil
-		}
-		r.promiseJobQueuePriority = false
-		r.vm.stack = nil
-	}()
-	// Re-read the hook and abort state per job so mid-batch hook
-	// changes or terminal Abort take effect immediately.
-	for len(r.jobQueue) > 0 {
-		if r.vm.isAborted() {
-			if r.promiseJobEnqueuer != nil {
-				r.leaveAbrupt()
-			}
-			finished = true
-			return
-		}
-		jobs := r.jobQueue
-		r.jobQueue = nil
-		for i, job := range jobs {
-			if r.vm.isAborted() {
-				if r.promiseJobEnqueuer != nil {
-					remaining := make([]func(), len(jobs[i:]))
-					copy(remaining, jobs[i:])
-					r.jobQueue = append(remaining, r.jobQueue...)
-					r.leaveAbrupt()
-				}
-				finished = true
-				return
-			}
-			if hook := r.promiseJobEnqueuer; hook != nil {
-				hook(job)
-			} else {
-				func() {
-					defer func() {
-						if x := recover(); x != nil {
-							if r.promiseJobEnqueuer != nil && i+1 < len(jobs) {
-								remaining := make([]func(), len(jobs[i+1:]))
-								copy(remaining, jobs[i+1:])
-								r.jobQueue = append(remaining, r.jobQueue...)
-							}
-							panic(x)
-						}
-					}()
-					job()
-				}()
-			}
-		}
-	}
-	finished = true
+// takePromiseJob removes the next job before attempting its delivery. Keeping
+// the remaining jobs in r.jobQueue preserves their ownership and order even
+// when the enqueuer panics or reenters the runtime. An attempted delivery is
+// never retried: a hook may have accepted the job before it panicked.
+func (r *Runtime) takePromiseJob() func() {
+	job := r.jobQueue[0]
+	r.jobQueue[0] = nil
+	r.jobQueue = r.jobQueue[1:]
+	return job
 }
 
-// called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
+// called when the top level function returns normally (i.e. control is passed outside the Runtime).
+func (r *Runtime) leave() {
+	// A hook may complete a nested abrupt cleanup and reset leavingAbrupt.
+	// Remember its completion so no queued job is executed by this leave once
+	// ownership of the queue passed to that cleanup.
+	abruptLeaves := r.abruptLeaves
+	defer func() {
+		if len(r.jobQueue) == 0 && !r.leavingAbrupt {
+			r.jobQueue = nil
+			r.promiseJobQueuePriority = false
+		}
+		r.vm.stack = nil
+	}()
+	for len(r.jobQueue) > 0 {
+		// A reentrant cleanup must not consume or discard the outer
+		// abrupt leave's pending work.
+		if r.leavingAbrupt || r.abruptLeaves != abruptLeaves {
+			return
+		}
+		if r.vm.isAborted() {
+			r.leaveAbrupt()
+			return
+		}
+		r.promiseJobQueuePriority = true
+		job := r.takePromiseJob()
+		// Re-read the hook per job so replacement or removal takes effect
+		// immediately. The native boundary handles either kind of panic.
+		if hook := r.promiseJobEnqueuer; hook != nil {
+			hook(job)
+		} else {
+			job()
+		}
+	}
+}
+
+// called when a top-level native boundary exits abruptly. It transfers jobs to
+// the host without executing them and retains the original error or panic if a
+// hook panics during cleanup.
 func (r *Runtime) leaveAbrupt() {
+	r.leaveAbruptInternal(false)
+}
+
+// leaveAbruptInternal transfers pending jobs without executing them. When
+// preserveInterrupt is set (a catchable native panic), the ordinary interrupt
+// flag set by native code is left intact; only an uncatchable exit clears it.
+func (r *Runtime) leaveAbruptInternal(preserveInterrupt bool) {
 	// Nested calls (from RunPromiseJob's error path inside a hook)
-	// must not clear the interrupt; only the outermost call owns
-	// ClearInterrupt().
+	// must not clear the queue, its priority, or the interrupt. The outermost
+	// cleanup owns these and will transfer work added by a reentrant hook.
 	if r.leavingAbrupt {
-		r.jobQueue = nil
-		r.promiseJobQueuePriority = false
 		r.vm.stack = nil
 		r.vm.prg = nil
 		r.vm.sb = -1
 		return
 	}
+	// A hook may synchronously reenter after a native panic. The abandoned
+	// program and operand stack must not be visible to that new entry.
+	r.vm.stack = nil
+	r.vm.prg = nil
+	r.vm.sb = -1
 	r.leavingAbrupt = true
 	defer func() {
 		r.leavingAbrupt = false
+		r.abruptLeaves++
 		// in a defer so cleanup still runs if hook(job) panics
 		r.jobQueue = nil
 		r.promiseJobQueuePriority = false
 		r.vm.stack = nil
 		r.vm.prg = nil
 		r.vm.sb = -1
-		r.ClearInterrupt()
+		if !preserveInterrupt {
+			r.ClearInterrupt()
+		}
 	}()
 
+	hook := r.promiseJobEnqueuer
 	for len(r.jobQueue) > 0 {
-		if r.promiseJobEnqueuer == nil {
-			break
-		}
-		jobs := r.jobQueue
-		r.jobQueue = nil
-		for _, job := range jobs {
-			hook := r.promiseJobEnqueuer
+		// A hook may remove itself mid-cleanup (for example to stop callback
+		// admission). Keep using the cleanup's hook for jobs already queued so
+		// work it enqueued is handed off instead of silently discarded.
+		current := r.promiseJobEnqueuer
+		if current == nil {
 			if hook == nil {
 				break
 			}
-			// recover so a panicking hook does not propagate out of
-			// leaveAbrupt; the caller's defer has already set the
-			// InterruptedError, so drop the panic and keep forwarding
-			// the remaining jobs.
-			func() {
-				defer func() {
-					_ = recover()
-				}()
-				hook(job)
-			}()
+			current = hook
 		}
+		r.promiseJobQueuePriority = true
+		job := r.takePromiseJob()
+		// The original abrupt completion takes precedence over a hook
+		// failure. Each remaining job still gets one delivery attempt.
+		func() {
+			frame := r.vm.saveExecutionFrame()
+			defer func() {
+				_ = recover()
+				// This cleanup runs after the main boundary restored its
+				// frame. A hook's direct Value API needs its own boundary.
+				r.vm.restoreExecutionFrame(frame)
+			}()
+			current(job)
+		}()
 	}
 }
 

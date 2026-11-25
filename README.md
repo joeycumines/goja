@@ -316,6 +316,26 @@ It preserves completed results and does not change ordinary `Interrupt` behavior
 `Promise.ObserveSettlement` lets a host observe actual fulfillment or rejection
 without adding a JavaScript reaction or marking a rejection as handled; its
 callback runs synchronously on the runtime owner and must not execute JavaScript.
+Observers registered while pending run in registration order after settlement
+tracking and reaction scheduling. Registration after settlement invokes the
+observer immediately, including from a tracker, enqueuer, or another observer;
+such a registration can therefore run before the pending observer batch.
+
+The native resolving functions return JavaScript exceptions raised during
+argument conversion or resolver execution as errors, as well as uncatchable
+runtime errors. Later job execution and forwarding retain the runtime's error
+and panic behavior; a JavaScript exception from an exit-time forwarding hook
+can still propagate as a panic.
+Terminal rejection restores its caller's VM context even when a host callback
+attempts JavaScript through a direct `Value` or `Object` API. A callback failure
+does not undo settlement. Unattempted reaction jobs are preserved for runtime
+exit processing: a configured enqueuer receives them during abrupt cleanup,
+while the default internal queue is discarded. An enqueuer invocation that
+panics is not retried, and an observer panic does not replace a tracker or
+enqueuer panic already unwinding.
+Errors created by `NewGoError` retain the original Go error identity for
+`errors.Is` and `errors.As`, even if JavaScript changes their `value` property
+or prototype.
 
 NodeJS Compatibility
 --------------------

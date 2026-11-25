@@ -727,6 +727,24 @@ func (vm *vm) ClearInterrupt() {
 	vm.interruptLock.Unlock()
 }
 
+// unwrapDestructSource follows object-rest wrappers without dispatching any
+// property access through them: a wrapper forwards getOwnPropStr into its
+// wrapped value, which can enter a proxy trap and run user code during stack
+// capture. The depth bound also handles corrupt cycles.
+func unwrapDestructSource(f *Object) *Object {
+	for seen := 0; f != nil && f.self != nil; seen++ {
+		d, wrapped := f.self.(*destructKeyedSource)
+		if !wrapped {
+			return f
+		}
+		if seen > 1024 {
+			return nil
+		}
+		f, _ = d.wrapped.(*Object)
+	}
+	return nil
+}
+
 func getFuncName(stack []Value, sb int) unistring.String {
 	if sb > 0 && sb <= len(stack) {
 		if f, ok := stack[sb-1].(*Object); ok && f != nil {
@@ -734,18 +752,9 @@ func getFuncName(stack []Value, sb int) unistring.String {
 			// callee. Unwrap it before any property dispatch: forwarding
 			// getOwnPropStr through the wrapper can enter a proxy trap and
 			// invoke user code while capturing an interrupt stack.
-			for {
-				if f.self == nil {
-					return ""
-				}
-				d, wrapped := f.self.(*destructKeyedSource)
-				if !wrapped {
-					break
-				}
-				f, ok = d.wrapped.(*Object)
-				if !ok || f == nil {
-					return ""
-				}
+			f = unwrapDestructSource(f)
+			if f == nil {
+				return ""
 			}
 			if _, isProxy := f.self.(*proxyObject); isProxy {
 				return "proxy"
@@ -753,12 +762,30 @@ func getFuncName(stack []Value, sb int) unistring.String {
 			// Stack capture must never invoke user code, particularly while
 			// unwinding an interrupt. A name getter (or a coercion of its
 			// result) could recurse into the interrupted VM or never return.
-			name := f.self.getOwnPropStr("name")
-			if prop, ok := name.(*valueProperty); ok {
-				if prop.accessor || prop.getterFunc != nil || prop.setterFunc != nil {
-					return ""
+			// Read only side-effect-free own data properties, walking the
+			// prototype chain explicitly so inherited function names still
+			// appear in stack frames without invoking getters or proxies.
+			var name Value
+			for current := f; current != nil; {
+				current = unwrapDestructSource(current)
+				if current == nil || current.self == nil {
+					break
 				}
-				name = prop.value
+				if _, isProxy := current.self.(*proxyObject); isProxy {
+					break
+				}
+				candidate := current.self.getOwnPropStr("name")
+				if prop, ok := candidate.(*valueProperty); ok {
+					if prop.accessor || prop.getterFunc != nil || prop.setterFunc != nil {
+						break
+					}
+					candidate = prop.value
+				}
+				if candidate != nil && candidate != _undefined {
+					name = candidate
+					break
+				}
+				current = current.self.proto()
 			}
 			// Only side-effect-free primitives may be formatted; *Object
 			// runs user coercion/Proxy traps and *Symbol throws TypeError.
@@ -880,7 +907,8 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 func (vm *vm) handleThrow(arg interface{}) *Exception {
 	ex := vm.exceptionFromValue(arg)
 	for len(vm.tryStack) > 0 {
-		tf := &vm.tryStack[len(vm.tryStack)-1]
+		frameIdx := len(vm.tryStack) - 1
+		tf := &vm.tryStack[frameIdx]
 		if tf.catchPos == -1 && tf.finallyPos == -1 || ex == nil && tf.catchPos != tryPanicMarker {
 			tf.exception = nil
 			vm.popTryFrame()
@@ -900,6 +928,8 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 			break
 		}
 		_ = vm.restoreStacks(tf.iterLen, tf.refLen)
+		// IteratorClose may execute nested code and reallocate tryStack.
+		tf = &vm.tryStack[frameIdx]
 
 		if tf.catchPos == tryPanicMarker {
 			break

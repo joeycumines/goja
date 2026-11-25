@@ -8,6 +8,9 @@ type errorObject struct {
 	baseObject
 	stack          []StackFrame
 	stackPropAdded bool
+	// The native cause is independent of mutable JavaScript properties and
+	// prototypes, so errors.Is/As/Unwrap never need to enter the interpreter.
+	nativeError error
 }
 
 func (e *errorObject) formatStack() String {

@@ -44,6 +44,12 @@ type PromiseRejectionTracker func(p *Promise, operation PromiseRejectionOperatio
 // before the forwarded (older) jobs. Install the enqueuer before enqueuing any
 // jobs if global FIFO ordering is required.
 //
+// A hook invocation is considered a delivery even if it panics and is not
+// retried. Reactions not yet delivered are retained for the runtime's exit
+// processing. On an abrupt exit they are forwarded to the current hook without
+// being executed by the runtime; additional hook panics during that cleanup do
+// not replace the failure already being propagated.
+//
 // Set to nil (the default) to restore the internal queue.
 // Register via Runtime.SetPromiseJobEnqueuer.
 type PromiseJobEnqueuer func(job func())
@@ -94,18 +100,26 @@ func (p *Promise) Result() Value {
 
 // ObserveSettlement registers a native observer for this Promise's actual
 // fulfillment or rejection. Resolving to a thenable does not notify observers
-// until the adopted result settles. The callback runs synchronously
-// after State and Result have been published, after due JavaScript reactions
-// and rejection tracking are scheduled; an already-settled Promise calls it
-// immediately. Observers registered while the Promise is pending run in
-// registration order. Registration after settlement invokes immediately,
-// including when it happens from another observer. These callbacks do not add
-// JavaScript reactions or mark a rejection as handled.
+// until the adopted result settles. Callbacks registered while the Promise is
+// pending run synchronously in registration order after State and Result have
+// been published, rejection tracking has been attempted, and due JavaScript
+// reactions have been scheduled. Scheduling may retain jobs internally for
+// later delivery if a host hook panics. An already-settled Promise invokes a
+// newly registered observer immediately. This includes registration from a
+// rejection tracker, enqueuer, or another observer, so such an observer can run
+// before the pending observer batch. These callbacks do not add JavaScript
+// reactions or mark a rejection as handled.
 //
 // Like the Promise itself, this method is not goroutine-safe. The callback must
-// not execute JavaScript, panic, or call runtime.Goexit. A panic propagates and
-// prevents later observers from running, but cannot undo settlement; observer
-// references are cleared before any callback is invoked. A nil callback panics.
+// not execute JavaScript, panic, or call runtime.Goexit. An observer panic stops
+// later observers without undoing settlement or preventing due reactions from
+// being scheduled. The runtime's exit policy still governs execution or handoff
+// of those jobs. The panic propagates through the surrounding runtime boundary,
+// which can convert a JavaScript exception or uncatchable exception into a
+// returned error. If a
+// tracker or enqueuer panic is already unwinding, that original panic wins.
+// Observer references are cleared before any observer is invoked. A nil
+// callback panics.
 func (p *Promise) ObserveSettlement(observer func()) {
 	if observer == nil {
 		panic("goja: nil Promise settlement observer")
@@ -118,6 +132,14 @@ func (p *Promise) ObserveSettlement(observer func()) {
 }
 
 func (p *Promise) notifySettlement() {
+	// This method is deferred by fulfill and reject. Preserve an earlier
+	// scheduling/tracker failure even if an observer also panics.
+	if original := recover(); original != nil {
+		defer func() {
+			_ = recover()
+			panic(original)
+		}()
+	}
 	observers := p.settlementObservers
 	p.settlementObservers = nil
 	for _, observer := range observers {
@@ -189,14 +211,20 @@ func (p *Promise) reject(reason Value) Value {
 	p.result = reason
 	p.fulfillReactions, p.rejectReactions = nil, nil
 	p.state = PromiseStateRejected
-	// Observers are notified last via defer so neither an observer panic nor
-	// a tracker/enqueuer panic can strand due settlement work or observers.
+	// Notify the pending observer batch after scheduling, including when a
+	// host callback panics. A failed tracker must not discard due reactions.
 	defer p.notifySettlement()
 	r := p.val.runtime
+	defer func() {
+		if original := recover(); original != nil {
+			r.bufferPromiseReactions(reactions, reason)
+			panic(original)
+		}
+		r.triggerPromiseReactions(reactions, reason)
+	}()
 	if !p.handled {
 		r.trackPromiseRejection(p, PromiseRejectionReject)
 	}
-	r.triggerPromiseReactions(reactions, reason)
 	return _undefined
 }
 
@@ -208,8 +236,8 @@ func (p *Promise) fulfill(value Value) Value {
 	p.result = value
 	p.fulfillReactions, p.rejectReactions = nil, nil
 	p.state = PromiseStateFulfilled
-	// Observers are notified last via defer so neither an observer panic nor
-	// an enqueuer panic can strand due reactions or observers.
+	// triggerPromiseReactions retains an unattempted tail if a hook panics;
+	// notifySettlement preserves that failure while notifying observers.
 	defer p.notifySettlement()
 	p.val.runtime.triggerPromiseReactions(reactions, value)
 	return _undefined
@@ -236,16 +264,33 @@ func (p *Promise) addReactions(fulfillReaction *promiseReaction, rejectReaction 
 	case PromiseStatePending:
 		p.fulfillReactions = append(p.fulfillReactions, fulfillReaction)
 		p.rejectReactions = append(p.rejectReactions, rejectReaction)
+		p.handled = true
 	case PromiseStateFulfilled:
+		p.handled = true
 		r.enqueuePromiseJob(r.newPromiseReactionJob(fulfillReaction, p.result))
 	default:
 		reason := p.result
-		if !p.handled {
-			r.trackPromiseRejection(p, PromiseRejectionHandle)
+		wasHandled := p.handled
+		// Grab has succeeded and this reaction is now registered. Commit
+		// the transition before callbacks so tracker reentry or a later
+		// hook panic cannot produce another first-handle notification.
+		p.handled = true
+		if !wasHandled {
+			func() {
+				defer func() {
+					if original := recover(); original != nil {
+						// Registration has committed even if its notification
+						// fails. Let the enclosing boundary restore the VM
+						// before transferring this still-unattempted job.
+						r.bufferPromiseReactions([]*promiseReaction{rejectReaction}, reason)
+						panic(original)
+					}
+				}()
+				r.trackPromiseRejection(p, PromiseRejectionHandle)
+			}()
 		}
 		r.enqueuePromiseJob(r.newPromiseReactionJob(rejectReaction, reason))
 	}
-	p.handled = true
 }
 
 func (r *Runtime) newPromiseResolveThenableJob(p *Promise, thenable Value, then *jobCallback) func() {
@@ -286,8 +331,29 @@ func (r *Runtime) enqueuePromiseJob(job func()) {
 }
 
 func (r *Runtime) triggerPromiseReactions(reactions []*promiseReaction, argument Value) {
-	for _, reaction := range reactions {
+	next := 0
+	defer func() {
+		if original := recover(); original != nil {
+			// Do not call more host hooks while unwinding their failure: a
+			// hook may have entered JavaScript through a direct Value API.
+			// Retain the remaining jobs before notifying observers; the
+			// enclosing runtime boundary restores the VM before forwarding.
+			r.bufferPromiseReactions(reactions[next:], argument)
+			panic(original)
+		}
+	}()
+	for i, reaction := range reactions {
+		next = i + 1 // An attempted delivery must not be repeated.
 		r.enqueuePromiseJob(r.newPromiseReactionJob(reaction, argument))
+	}
+}
+
+func (r *Runtime) bufferPromiseReactions(reactions []*promiseReaction, argument Value) {
+	for _, reaction := range reactions {
+		r.jobQueue = append(r.jobQueue, r.newPromiseReactionJob(reaction, argument))
+	}
+	if len(reactions) > 0 {
+		r.promiseJobQueuePriority = true
 	}
 }
 
@@ -731,7 +797,7 @@ func (r *Runtime) getPromise() *Object {
 }
 
 func (r *Runtime) wrapPromiseReaction(p *Promise, fObj *Object, rejecting bool) func(interface{}) error {
-	f, _ := AssertFunction(fObj)
+	f, _ := fObj.self.assertCallable()
 	return func(x interface{}) error {
 		if rejecting && r.vm.isAborted() {
 			// JavaScript can no longer finish thenable adoption after an
@@ -740,19 +806,36 @@ func (r *Runtime) wrapPromiseReaction(p *Promise, fObj *Object, rejecting bool) 
 			// Completed results and ordinary Interrupt semantics are unchanged.
 			return r.rejectAbortedPromise(p, x)
 		}
-		_, err := f(nil, r.ToValue(x))
-		return err
+		// Conversion can throw, for example for an Object from another
+		// runtime. It belongs inside the same boundary as the resolver.
+		return r.runWrapped(func() {
+			f(FunctionCall{Arguments: []Value{r.ToValue(x)}})
+		})
 	}
 }
 
 // rejectAbortedPromise settles a still-pending native Promise after a terminal
-// abort without entering the VM or running queued jobs. A configured
+// abort without evaluating JavaScript or running queued jobs. A configured
 // PromiseJobEnqueuer still receives the resulting reaction jobs; the host owns
 // their execution and RunPromiseJob rejects them with the abort cause.
 func (r *Runtime) rejectAbortedPromise(p *Promise, x interface{}) (err error) {
 	if p.state != PromiseStatePending {
 		return nil
 	}
+	vm := r.vm
+	frame := vm.saveExecutionFrame()
+	defer func() {
+		// A direct native-to-JavaScript call can alter registers such as pc
+		// before pushing its own context. Restore the entire caller context,
+		// not only the stacks restored by the try frame.
+		vm.restoreExecutionFrame(frame)
+		if frame.callStackLen == 0 && !r.asyncTrackerActive && !r.leavingAbrupt {
+			// No runWrapped/leave boundary owns this native cleanup. Forward
+			// any retained jobs without executing them and clear VM scratch
+			// state, including tails left by a callback's direct Value API.
+			r.leaveAbrupt()
+		}
+	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if ex := asUncatchableException(recovered); ex != nil {
@@ -762,13 +845,24 @@ func (r *Runtime) rejectAbortedPromise(p *Promise, x interface{}) (err error) {
 			}
 		}
 	}()
-	p.reject(r.ToValue(x))
+	// Host callbacks can enter the interpreter through direct Value/Object
+	// APIs. A try frame restores their caller's context on both catchable
+	// exceptions and terminal interruption before the recovery above runs.
+	if ex := r.vm.try(func() { p.reject(r.ToValue(x)) }); ex != nil {
+		return ex
+	}
 	return nil
 }
 
 // NewPromise creates and returns a Promise and resolving functions for it.
-// The returned errors will be uncatchable errors, such as InterruptedError or StackOverflowError, which should be propagated upwards.
-// Exceptions are handled through [PromiseRejectionTracker].
+// The resolving functions return errors raised during argument conversion or
+// resolver execution, including *Exception, *InterruptedError, and
+// *StackOverflowError. Such errors should be propagated upwards. A promise
+// rejection itself is reported through [PromiseRejectionTracker], not as a
+// returned error. Later job execution or forwarding follows the runtime's exit
+// policy: an exit-time callback's JavaScript exception can still propagate as a
+// panic. Other Go panics are re-thrown after runtime cleanup; hook failures
+// during abrupt cleanup do not replace the original failure.
 //
 // After [Runtime.Abort], reject can also reject a still-pending Promise whose
 // resolve function already adopted a thenable. This permits native terminal
@@ -805,6 +899,8 @@ func (r *Runtime) NewPromise() (promise *Promise, resolve, reject func(reason in
 // rejected promise for the first time (with operation argument set to PromiseRejectionHandle).
 //
 // Setting a tracker replaces any existing one. Setting it to nil disables the functionality.
+// Once a reaction is registered, its promise remains handled even if the tracker
+// or enqueuer panics; reentry does not repeat the first-handle notification.
 //
 // See https://tc39.es/ecma262/#sec-host-promise-rejection-tracker for more details.
 func (r *Runtime) SetPromiseRejectionTracker(tracker PromiseRejectionTracker) {
