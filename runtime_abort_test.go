@@ -2,6 +2,7 @@ package goja
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -348,4 +349,156 @@ func TestInterruptRemainsReusableWithoutAbort(t *testing.T) {
 	if err != nil || value.ToInteger() != 42 {
 		t.Fatalf("ordinary interrupted runtime is not reusable: value=%v error=%v", value, err)
 	}
+}
+
+func TestUncatchableUnwindSkipsIteratorClose(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		name := "interrupt"
+		if abort {
+			name = "abort"
+		}
+		t.Run(name, func(t *testing.T) {
+			rt := New()
+			cause := errors.New("stop loop")
+			returnCalls, returnTraps, finallyRuns := 0, 0, 0
+			if err := rt.Set("onReturnCall", func() { returnCalls++ }); err != nil {
+				t.Fatal(err)
+			}
+			if err := rt.Set("onReturnTrap", func() { returnTraps++ }); err != nil {
+				t.Fatal(err)
+			}
+			if err := rt.Set("onFinally", func() { finallyRuns++ }); err != nil {
+				t.Fatal(err)
+			}
+			if err := rt.Set("stopNow", func() {
+				if abort {
+					rt.Abort(cause)
+				} else {
+					rt.Interrupt(cause)
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			_, err := rt.RunString(`
+				const iterable = {
+					[Symbol.iterator]() {
+						const raw = {
+							next() { return { value: 1, done: false }; },
+							return() { onReturnCall(); return { done: true }; }
+						};
+						return new Proxy(raw, {
+							get(target, key, receiver) {
+								if (key === "return") { onReturnTrap(); }
+								return Reflect.get(target, key, receiver);
+							}
+						});
+					}
+				};
+				function* gen() {
+					try { yield 1; } finally { onFinally(); }
+				}
+				function outerLoop() {
+					for (const a of iterable) {
+						for (const b of gen()) {
+							stopNow();
+							for (;;) {}
+						}
+					}
+				}
+				outerLoop();
+			`)
+			requireAbortCause(t, err, cause)
+			var interrupted *InterruptedError
+			if !errors.As(err, &interrupted) || !strings.Contains(interrupted.String(), "outerLoop") {
+				t.Fatalf("interrupt stack lost outerLoop frame: %s", err)
+			}
+			if returnCalls != 0 || returnTraps != 0 || finallyRuns != 0 {
+				t.Fatalf("IteratorClose ran on uncatchable unwind: returnCalls=%d returnTraps=%d finallyRuns=%d", returnCalls, returnTraps, finallyRuns)
+			}
+			if len(rt.vm.iterStack) != 0 || len(rt.vm.refStack) != 0 {
+				t.Fatalf("VM stacks not cleared: iterStack=%d refStack=%d", len(rt.vm.iterStack), len(rt.vm.refStack))
+			}
+			if !abort {
+				val, err := rt.RunString(`let s = 0; for (const x of [10, 20, 12]) { s += x; } s;`)
+				if err != nil || val.ToInteger() != 42 {
+					t.Fatalf("reused runtime failed after interrupt in for-of: val=%v err=%v", val, err)
+				}
+			}
+		})
+	}
+
+	t.Run("promise_all_step_abort_skips_iterator_close", func(t *testing.T) {
+		rt := New()
+		cause := errors.New("abort inside promise.all step")
+		returnCalls := 0
+		if err := rt.Set("onReturn", func() { returnCalls++ }); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.Set("abortStep", func() {
+			rt.Abort(cause)
+			if _, err := rt.RunString(`for (;;) {}`); err != nil {
+				panic(err)
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := rt.RunString(`
+			const iterable = {
+				[Symbol.iterator]() {
+					return {
+						next() { return { value: 1, done: false }; },
+						return() { onReturn(); return { done: true }; }
+					};
+				}
+			};
+			function CustomPromise(executor) {
+				executor(function () {}, function () {});
+			}
+			CustomPromise.resolve = function () {
+				abortStep();
+			};
+			Promise.all.call(CustomPromise, iterable);
+		`)
+		requireAbortCause(t, err, cause)
+		if returnCalls != 0 {
+			t.Fatalf("IteratorClose ran on uncatchable Promise.all step: %d calls", returnCalls)
+		}
+	})
+
+	t.Run("promise_all_iterator_close_propagates_abort", func(t *testing.T) {
+		rt := New()
+		cause := errors.New("abort inside iterator return")
+		returnCalls := 0
+		if err := rt.Set("onReturn", func() {
+			returnCalls++
+			rt.Abort(cause)
+			_, err := rt.RunString(`for (;;) {}`)
+			if err != nil {
+				panic(err)
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := rt.RunString(`
+			const iterable = {
+				[Symbol.iterator]() {
+					return {
+						next() { return { value: 1, done: false }; },
+						return() { onReturn(); return { done: true }; }
+					};
+				}
+			};
+			function CustomPromise(executor) {
+				executor(function () {}, function () {});
+			}
+			CustomPromise.resolve = function () {
+				throw new Error("step failure");
+			};
+			Promise.all.call(CustomPromise, iterable);
+		`)
+		requireAbortCause(t, err, cause)
+		if returnCalls != 1 {
+			t.Fatalf("returnCalls = %d, want 1", returnCalls)
+		}
+	})
 }

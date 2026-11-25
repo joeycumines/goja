@@ -93,8 +93,8 @@ func (p *Promise) Result() Value {
 }
 
 // ObserveSettlement registers a native observer for this Promise's actual
-// fulfillment or rejection. Resolving to a pending thenable does not notify
-// observers until the adopted result settles. The callback runs synchronously
+// fulfillment or rejection. Resolving to a thenable does not notify observers
+// until the adopted result settles. The callback runs synchronously
 // after State and Result have been published, after due JavaScript reactions
 // and rejection tracking are scheduled; an already-settled Promise calls it
 // immediately. Observers registered while the Promise is pending run in
@@ -163,11 +163,7 @@ func (p *Promise) createResolvingFunctions() (resolve, reject *Object) {
 				}
 				if call, ok := assertCallable(thenAction); ok {
 					job := r.newPromiseResolveThenableJob(p, resolution, &jobCallback{callback: call})
-					r.enqueuePromiseJob(func() {
-						if p.state == PromiseStatePending {
-							job()
-						}
-					})
+					r.enqueuePromiseJob(job)
 					return _undefined
 				}
 			}
@@ -193,14 +189,14 @@ func (p *Promise) reject(reason Value) Value {
 	p.result = reason
 	p.fulfillReactions, p.rejectReactions = nil, nil
 	p.state = PromiseStateRejected
+	// Observers are notified last via defer so neither an observer panic nor
+	// a tracker/enqueuer panic can strand due settlement work or observers.
+	defer p.notifySettlement()
 	r := p.val.runtime
 	if !p.handled {
 		r.trackPromiseRejection(p, PromiseRejectionReject)
 	}
 	r.triggerPromiseReactions(reactions, reason)
-	// Observers are notified last so a panic cannot strand settlement work
-	// that was already due when the Promise was settled.
-	p.notifySettlement()
 	return _undefined
 }
 
@@ -212,10 +208,10 @@ func (p *Promise) fulfill(value Value) Value {
 	p.result = value
 	p.fulfillReactions, p.rejectReactions = nil, nil
 	p.state = PromiseStateFulfilled
+	// Observers are notified last via defer so neither an observer panic nor
+	// an enqueuer panic can strand due reactions or observers.
+	defer p.notifySettlement()
 	p.val.runtime.triggerPromiseReactions(reactions, value)
-	// Observers are notified last so a panic cannot strand reactions that
-	// were already due when the Promise was settled.
-	p.notifySettlement()
 	return _undefined
 }
 
@@ -278,6 +274,9 @@ func (r *Runtime) enqueuePromiseJob(job func()) {
 	// are also buffered to preserve FIFO.
 	if hook := r.promiseJobEnqueuer; hook != nil && !r.asyncTrackerActive && !r.promiseJobQueuePriority {
 		hook(job)
+		return
+	}
+	if r.promiseJobEnqueuer == nil && r.vm.isAborted() {
 		return
 	}
 	r.jobQueue = append(r.jobQueue, job)

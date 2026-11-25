@@ -1,6 +1,7 @@
 package goja
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/joeycumines/goja/unistring"
@@ -82,4 +83,71 @@ func TestGetFuncNameIgnoresAccessorAndProxyTraps(t *testing.T) {
 	if traps != 0 {
 		t.Fatalf("proxy descriptor trap ran %d times during stack capture", traps)
 	}
+}
+
+func TestGetFuncNameOutOfBoundsAndNonPrimitiveDataNames(t *testing.T) {
+	if got := getFuncName(nil, 1); got != "" {
+		t.Fatalf("nil stack name = %q, want empty", got)
+	}
+	if got := getFuncName([]Value{_undefined}, 2); got != "" {
+		t.Fatalf("out-of-bounds stack name = %q, want empty", got)
+	}
+
+	rt := New()
+	coercions := 0
+	if err := rt.Set("recordCoercion", func() { coercions++ }); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("abort with object name")
+	if err := rt.Set("targetFn", func() {
+		if frames := rt.CaptureCallStack(0, nil); len(frames) == 0 {
+			t.Error("expected call stack frames")
+		}
+		rt.Abort(cause)
+		_ = rt.NewGoError(cause)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.RunString(`
+		const badName = new Proxy({
+			toString() { recordCoercion(); return "coerced"; },
+			[Symbol.toPrimitive]() { recordCoercion(); return "coerced"; }
+		}, {
+			get(target, key, receiver) {
+				recordCoercion();
+				return Reflect.get(target, key, receiver);
+			}
+		});
+		Object.defineProperty(targetFn, "name", { value: badName, configurable: true });
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getFuncName([]Value{rt.Get("targetFn"), _undefined}, 1); got != "" {
+		t.Fatalf("object data name = %q, want empty", got)
+	}
+	_, err := rt.RunString(`targetFn(); 1 + 1`)
+	requireAbortCause(t, err, cause)
+	if coercions != 0 {
+		t.Fatalf("stack capture ran %d object/proxy coercions", coercions)
+	}
+
+	rtSym := New()
+	symCause := errors.New("abort with symbol name")
+	if err := rtSym.Set("symFn", func() {
+		rtSym.Abort(symCause)
+		_, innerErr := rtSym.RunString(`try { for (;;) {} } catch (e) {}`)
+		requireAbortCause(t, innerErr, symCause)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rtSym.RunString(`
+		Object.defineProperty(symFn, "name", { value: Symbol("boom"), configurable: true });
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getFuncName([]Value{rtSym.Get("symFn"), _undefined}, 1); got != "" {
+		t.Fatalf("symbol data name = %q, want empty", got)
+	}
+	_, err = rtSym.RunString(`try { symFn(); } catch (e) {}`)
+	requireAbortCause(t, err, symCause)
 }

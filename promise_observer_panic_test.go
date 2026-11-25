@@ -131,3 +131,34 @@ func TestPromiseSettlementObserverPanicStopsLaterObservers(t *testing.T) {
 		t.Fatalf("settlement observers retained after notification: %d", len(promise.settlementObservers))
 	}
 }
+
+func TestPromiseSettlementObserverPanicWithoutEnqueuerCleansVMState(t *testing.T) {
+	rt := New()
+	promise, resolve, _ := rt.NewPromise()
+	promise.ObserveSettlement(func() {
+		panic("observer failed")
+	})
+	if err := rt.Set("settle", func() {
+		_ = resolve("done")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() {
+			if got := recover(); got != "observer failed" {
+				t.Fatalf("panic = %v, want observer failure", got)
+			}
+		}()
+		_, _ = rt.RunString(`settle()`)
+		t.Fatal("observer panic did not propagate")
+	}()
+
+	if rt.vm.prg != nil || rt.vm.sb != -1 || len(rt.vm.stack) != 0 {
+		t.Fatalf("VM state dirty after observer panic: prg=%v sb=%d stack=%d", rt.vm.prg, rt.vm.sb, len(rt.vm.stack))
+	}
+	val, err := rt.RunString(`21 + 21`)
+	if err != nil || val.ToInteger() != 42 {
+		t.Fatalf("runtime broken after observer panic: val=%v err=%v", val, err)
+	}
+}

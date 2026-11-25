@@ -728,7 +728,7 @@ func (vm *vm) ClearInterrupt() {
 }
 
 func getFuncName(stack []Value, sb int) unistring.String {
-	if sb > 0 {
+	if sb > 0 && sb <= len(stack) {
 		if f, ok := stack[sb-1].(*Object); ok && f != nil {
 			// Object-rest destructuring can leave an internal wrapper as the
 			// callee. Unwrap it before any property dispatch: forwarding
@@ -755,18 +755,22 @@ func getFuncName(stack []Value, sb int) unistring.String {
 			// result) could recurse into the interrupted VM or never return.
 			name := f.self.getOwnPropStr("name")
 			if prop, ok := name.(*valueProperty); ok {
-				if prop.accessor {
+				if prop.accessor || prop.getterFunc != nil || prop.setterFunc != nil {
 					return ""
 				}
 				name = prop.value
 			}
-			if name, ok := name.(String); ok {
+			// Only side-effect-free primitives may be formatted; *Object
+			// runs user coercion/Proxy traps and *Symbol throws TypeError.
+			switch name := name.(type) {
+			case String:
 				return name.string()
-			}
-			if name != nil {
-				// Value implementations here are ordinary data values; no
-				// user-defined coercion runs during stack capture.
+			case valueInt, valueFloat, valueBool, valueUndefined, valueNull:
 				return name.string()
+			case *valueBigInt:
+				if name != nil {
+					return name.string()
+				}
 			}
 		}
 	}
@@ -842,8 +846,22 @@ func (vm *vm) popTryFrame() {
 	vm.tryStack = vm.tryStack[:len(vm.tryStack)-1]
 }
 
+func (vm *vm) discardStacks(iterLen, refLen uint32) {
+	iterTail := vm.iterStack[iterLen:]
+	for i := range iterTail {
+		iterTail[i] = iterStackItem{}
+	}
+	vm.iterStack = vm.iterStack[:iterLen]
+	refTail := vm.refStack[refLen:]
+	for i := range refTail {
+		refTail[i] = nil
+	}
+	vm.refStack = vm.refStack[:refLen]
+}
+
 func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 	// Restore other stacks
+	defer vm.discardStacks(iterLen, refLen)
 	iterTail := vm.iterStack[iterLen:]
 	for i := len(iterTail) - 1; i >= 0; i-- {
 		if iter := iterTail[i].iter; iter != nil {
@@ -856,12 +874,6 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 		}
 		iterTail[i] = iterStackItem{}
 	}
-	vm.iterStack = vm.iterStack[:iterLen]
-	refTail := vm.refStack[refLen:]
-	for i := range refTail {
-		refTail[i] = nil
-	}
-	vm.refStack = vm.refStack[:refLen]
 	return
 }
 
@@ -883,6 +895,10 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 		vm.sp = int(tf.sp)
 		vm.stash = tf.stash
 		vm.privEnv = tf.privEnv
+		if ex == nil {
+			vm.discardStacks(tf.iterLen, tf.refLen)
+			break
+		}
 		_ = vm.restoreStacks(tf.iterLen, tf.refLen)
 
 		if tf.catchPos == tryPanicMarker {

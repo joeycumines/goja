@@ -1459,13 +1459,14 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
 				if len(vm.callStack) == 0 {
-					if r.vm.isAborted() {
-						r.leaveDiscardJobs()
-					} else {
-						r.leaveAbrupt()
-					}
+					r.leaveAbrupt()
 				}
 			} else {
+				if len(vm.callStack) == 0 {
+					vm.stack = nil
+					vm.prg = nil
+					vm.sb = -1
+				}
 				panic(x)
 			}
 		}
@@ -2552,6 +2553,11 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 					r.leaveAbrupt()
 				}
 			} else {
+				if len(r.vm.callStack) == 0 {
+					r.vm.stack = nil
+					r.vm.prg = nil
+					r.vm.sb = -1
+				}
 				panic(x)
 			}
 		}
@@ -2632,6 +2638,10 @@ func (r *Runtime) RunPromiseJob(job func()) (err error) {
 				// or replacement takes effect immediately.
 				hook := r.promiseJobEnqueuer
 				if hook == nil {
+					if r.vm.isAborted() {
+						r.jobQueue = nil
+						break forward
+					}
 					// Remaining jobs are older than anything
 					// the just-run job appended, so keep them
 					// ahead for the next Run*() call.
@@ -2857,6 +2867,18 @@ func iteratorValue(iterResult *Object) Value {
 	return nilSafe(iterResult.self.getStr("value", nil))
 }
 
+func isJsException(x interface{}) bool {
+	if asUncatchableException(x) != nil {
+		return false
+	}
+	switch x.(type) {
+	case Value, *Exception, typeError, referenceError, rangeError, syntaxError:
+		return true
+	default:
+		return false
+	}
+}
+
 func (ir *iteratorRecord) iterate(step func(Value)) {
 	r := ir.iterator.runtime
 	for {
@@ -2872,9 +2894,11 @@ func (ir *iteratorRecord) iterate(step func(Value)) {
 			step(value)
 		})
 		if ret != nil {
-			_ = tryFunc(func() {
-				ir.returnIter()
-			})
+			if isJsException(ret) {
+				_ = r.vm.try(func() {
+					ir.returnIter()
+				})
+			}
 			panic(ret)
 		}
 	}
@@ -2956,44 +2980,59 @@ func (r *Runtime) getHash() *maphash.Hash {
 	return r.hash
 }
 
-// called after an uncatchable abort leaves the top-level Runtime call. Internal
-// jobs must not run; jobs already given to a host enqueuer are forwarded as in
-// leaveAbrupt, where RunPromiseJob rejects them with the abort cause.
-func (r *Runtime) leaveDiscardJobs() {
-	wasLeaving := r.leavingAbrupt
-	r.leavingAbrupt = true
-	defer func() {
-		r.leavingAbrupt = wasLeaving
-	}()
-	r.leaveAbrupt()
-}
-
 // called when the top level function returns normally (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
+	finished := false
 	defer func() {
-		r.jobQueue = nil
+		if finished || r.promiseJobEnqueuer == nil {
+			r.jobQueue = nil
+		}
 		r.promiseJobQueuePriority = false
 		r.vm.stack = nil
 	}()
-	if r.vm.isAborted() {
-		if r.promiseJobEnqueuer != nil {
-			r.leaveAbrupt()
-		}
-		return
-	}
-	// Re-read the hook per job so mid-batch clearing or replacement
-	// takes effect immediately.
+	// Re-read the hook and abort state per job so mid-batch hook
+	// changes or terminal Abort take effect immediately.
 	for len(r.jobQueue) > 0 {
+		if r.vm.isAborted() {
+			if r.promiseJobEnqueuer != nil {
+				r.leaveAbrupt()
+			}
+			finished = true
+			return
+		}
 		jobs := r.jobQueue
 		r.jobQueue = nil
-		for _, job := range jobs {
+		for i, job := range jobs {
+			if r.vm.isAborted() {
+				if r.promiseJobEnqueuer != nil {
+					remaining := make([]func(), len(jobs[i:]))
+					copy(remaining, jobs[i:])
+					r.jobQueue = append(remaining, r.jobQueue...)
+					r.leaveAbrupt()
+				}
+				finished = true
+				return
+			}
 			if hook := r.promiseJobEnqueuer; hook != nil {
 				hook(job)
 			} else {
-				job()
+				func() {
+					defer func() {
+						if x := recover(); x != nil {
+							if r.promiseJobEnqueuer != nil && i+1 < len(jobs) {
+								remaining := make([]func(), len(jobs[i+1:]))
+								copy(remaining, jobs[i+1:])
+								r.jobQueue = append(remaining, r.jobQueue...)
+							}
+							panic(x)
+						}
+					}()
+					job()
+				}()
 			}
 		}
 	}
+	finished = true
 }
 
 // called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
@@ -3003,6 +3042,7 @@ func (r *Runtime) leaveAbrupt() {
 	// ClearInterrupt().
 	if r.leavingAbrupt {
 		r.jobQueue = nil
+		r.promiseJobQueuePriority = false
 		r.vm.stack = nil
 		r.vm.prg = nil
 		r.vm.sb = -1
