@@ -18,8 +18,10 @@ type regexp2MatchCache struct {
 
 // Not goroutine-safe. Use regexp2Wrapper.clone()
 type regexp2Wrapper struct {
-	rx    *regexp2.Regexp
-	cache *regexp2MatchCache
+	rx      *regexp2.Regexp // immutable; compiled Programs may share it
+	options regexp2.RegexOptions
+	timed   *regexp2.Regexp // lazily compiled, owned by this wrapper's runtime
+	cache   *regexp2MatchCache
 }
 
 // Not goroutine-safe. Use regexpPattern.clone()
@@ -60,15 +62,52 @@ func compileRegexp2(src string, multiline, dotAll, ignoreCase, unicode bool) (*r
 		return nil, fmt.Errorf("Invalid regular expression (regexp2): %s (%v)", src, err1)
 	}
 
-	return &regexp2Wrapper{rx: regexp2Pattern}, nil
+	return &regexp2Wrapper{rx: regexp2Pattern, options: opts}, nil
 }
 
-func (p *regexpPattern) findSubmatchIndex(s String, start int) regexpResult {
-	return p.regexp2Wrapper.findSubmatchIndex(s, start, p.unicode, true)
+func (p *regexpPattern) findSubmatchIndex(rt *Runtime, s String, start int) regexpResult {
+	rt.vm.checkInterrupt()
+	return p.regexp2Wrapper.findSubmatchIndex(rt, s, start, p.unicode, true)
 }
 
-func (p *regexpPattern) findAllSubmatchIndex(s String, start int, limit int, sticky bool) []regexpResult {
-	return p.regexp2Wrapper.findAllSubmatchIndex(s, start, limit, sticky, p.unicode)
+func (p *regexpPattern) findAllSubmatchIndex(rt *Runtime, s String, start int, limit int, sticky bool) []regexpResult {
+	rt.vm.checkInterrupt()
+	return p.regexp2Wrapper.findAllSubmatchIndex(rt, s, start, limit, sticky, p.unicode)
+}
+
+func (r *regexp2Wrapper) findMatches(rt *Runtime, input []rune, start int, yield func(regexp2.MatchView) bool) {
+	rt.vm.checkInterrupt()
+	rx := r.rx
+	if limit := rt.regexpTimeLimit; limit > 0 {
+		if r.timed == nil {
+			// Never mutate the matcher shared by compiled Program clones, or
+			// copy regexp2's internal runner pools. Recompile its exact converted
+			// source and options once for this runtime-owned wrapper instead.
+			var err error
+			r.timed, err = regexp2.Compile(r.rx.String(), r.options)
+			if err != nil {
+				rt.vm.checkInterrupt()
+				panic(rangeError(err.Error()))
+			}
+		}
+		r.timed.MatchTimeout = limit
+		rx = r.timed
+	}
+	// Input conversion and the optional private compilation precede this
+	// point; cancellation during either must be observed before matching.
+	rt.vm.checkInterrupt()
+	err := rx.FindRunesMatches(input, start, func(match regexp2.MatchView) bool {
+		// Global operations can perform many individually short searches.
+		rt.vm.checkInterrupt()
+		return yield(match)
+	})
+	// The matcher's timeout is catchable, but host cancellation is not.
+	// No JavaScript catch/finally may run instead of an already-pending abort.
+	rt.vm.checkInterrupt()
+	if err != nil {
+		r.cache = nil
+		panic(rangeError(err.Error()))
+	}
 }
 
 // clone creates a copy of the regexpPattern which can be used concurrently.
@@ -96,14 +135,14 @@ type regexpObject struct {
 	standard bool
 }
 
-func (r *regexp2Wrapper) findSubmatchIndex(s String, start int, fullUnicode, doCache bool) regexpResult {
+func (r *regexp2Wrapper) findSubmatchIndex(rt *Runtime, s String, start int, fullUnicode, doCache bool) regexpResult {
 	if fullUnicode {
-		return r.findSubmatchIndexUnicode(s, start, doCache)
+		return r.findSubmatchIndexUnicode(rt, s, start, doCache)
 	}
-	return r.findSubmatchIndexUTF16(s, start, doCache)
+	return r.findSubmatchIndexUTF16(rt, s, start, doCache)
 }
 
-func (r *regexp2Wrapper) findSubmatchIndexUTF16(s String, start int, doCache bool) regexpResult {
+func (r *regexp2Wrapper) findSubmatchIndexUTF16(rt *Runtime, s String, start int, doCache bool) regexpResult {
 	var runes []rune
 	if cache := r.cache; cache != nil && cache.posMap == nil && cache.target.SameAs(s) {
 		runes = cache.runes
@@ -115,7 +154,7 @@ func (r *regexp2Wrapper) findSubmatchIndexUTF16(s String, start int, doCache boo
 	// Using FindRunesMatches with a one-shot callback instead of
 	// FindRunesMatchStartingAt keeps the match state inside regexp2's runner
 	// pool, avoiding the per-call Match and match text allocations.
-	err := r.rx.FindRunesMatches(runes, start, func(match regexp2.MatchView) bool {
+	r.findMatches(rt, runes, start, func(match regexp2.MatchView) bool {
 		matched = true
 		groupCount := match.GroupCount()
 		result = regexpResult{
@@ -135,9 +174,6 @@ func (r *regexp2Wrapper) findSubmatchIndexUTF16(s String, start int, doCache boo
 		}
 		return false
 	})
-	if err != nil {
-		panic(rangeError(err.Error()))
-	}
 	if doCache && matched {
 		if r.cache == nil {
 			r.cache = new(regexp2MatchCache)
@@ -152,7 +188,7 @@ func (r *regexp2Wrapper) findSubmatchIndexUTF16(s String, start int, doCache boo
 	return result
 }
 
-func (r *regexp2Wrapper) findSubmatchIndexUnicode(s String, start int, doCache bool) regexpResult {
+func (r *regexp2Wrapper) findSubmatchIndexUnicode(rt *Runtime, s String, start int, doCache bool) regexpResult {
 	var runes []rune
 	var posMap []int
 	var mappedStart int
@@ -175,7 +211,7 @@ func (r *regexp2Wrapper) findSubmatchIndexUnicode(s String, start int, doCache b
 	// Using FindRunesMatches with a one-shot callback instead of
 	// FindRunesMatchStartingAt keeps the match state inside regexp2's runner
 	// pool, avoiding the per-call Match and match text allocations.
-	err := r.rx.FindRunesMatches(runes, mappedStart, func(match regexp2.MatchView) bool {
+	r.findMatches(rt, runes, mappedStart, func(match regexp2.MatchView) bool {
 		matched = true
 		groupCount := match.GroupCount()
 		result = regexpResult{
@@ -195,9 +231,6 @@ func (r *regexp2Wrapper) findSubmatchIndexUnicode(s String, start int, doCache b
 		}
 		return false
 	})
-	if err != nil {
-		panic(rangeError(err.Error()))
-	}
 	if doCache && matched {
 		if r.cache == nil {
 			r.cache = new(regexp2MatchCache)
@@ -213,7 +246,7 @@ func (r *regexp2Wrapper) findSubmatchIndexUnicode(s String, start int, doCache b
 	return result
 }
 
-func (r *regexp2Wrapper) findAllSubmatchIndexUTF16(s String, start, limit int, sticky bool) []regexpResult {
+func (r *regexp2Wrapper) findAllSubmatchIndexUTF16(rt *Runtime, s String, start, limit int, sticky bool) []regexpResult {
 	runes := s.utf16Runes()
 	if limit < 0 {
 		limit = len(runes) + 1
@@ -221,7 +254,7 @@ func (r *regexp2Wrapper) findAllSubmatchIndexUTF16(s String, start, limit int, s
 	var results []regexpResult
 	var names []string
 	var flat []int
-	err := r.rx.FindRunesMatches(runes, start, func(match regexp2.MatchView) bool {
+	r.findMatches(rt, runes, start, func(match regexp2.MatchView) bool {
 		var result regexpResult
 		if groupCount := match.GroupCount(); groupCount > 1 {
 			if names == nil {
@@ -264,9 +297,6 @@ func (r *regexp2Wrapper) findAllSubmatchIndexUTF16(s String, start, limit int, s
 		limit--
 		return limit > 0
 	})
-	if err != nil {
-		panic(rangeError(err.Error()))
-	}
 	return results
 }
 
@@ -308,7 +338,7 @@ func posMapReverseLookup(posMap []int, pos int) (int, bool) {
 	return mapped, false
 }
 
-func (r *regexp2Wrapper) findAllSubmatchIndexUnicode(s unicodeString, start, limit int, sticky bool) []regexpResult {
+func (r *regexp2Wrapper) findAllSubmatchIndexUnicode(rt *Runtime, s unicodeString, start, limit int, sticky bool) []regexpResult {
 	var posMap []int
 	var runes []rune
 	var mappedStart int
@@ -332,7 +362,7 @@ func (r *regexp2Wrapper) findAllSubmatchIndexUnicode(s unicodeString, start, lim
 	var results []regexpResult
 	var names []string
 	var flat []int
-	err := r.rx.FindRunesMatches(runes, mappedStart, func(match regexp2.MatchView) bool {
+	r.findMatches(rt, runes, mappedStart, func(match regexp2.MatchView) bool {
 		var result regexpResult
 		if groupCount := match.GroupCount(); groupCount > 1 {
 			if names == nil {
@@ -373,26 +403,24 @@ func (r *regexp2Wrapper) findAllSubmatchIndexUnicode(s unicodeString, start, lim
 		limit--
 		return limit > 0
 	})
-	if err != nil {
-		panic(rangeError(err.Error()))
-	}
 	return results
 }
 
-func (r *regexp2Wrapper) findAllSubmatchIndex(s String, start, limit int, sticky, fullUnicode bool) []regexpResult {
+func (r *regexp2Wrapper) findAllSubmatchIndex(rt *Runtime, s String, start, limit int, sticky, fullUnicode bool) []regexpResult {
 	a, u := devirtualizeString(s)
 	if u != nil {
 		if fullUnicode {
-			return r.findAllSubmatchIndexUnicode(u, start, limit, sticky)
+			return r.findAllSubmatchIndexUnicode(rt, u, start, limit, sticky)
 		}
-		return r.findAllSubmatchIndexUTF16(u, start, limit, sticky)
+		return r.findAllSubmatchIndexUTF16(rt, u, start, limit, sticky)
 	}
-	return r.findAllSubmatchIndexUTF16(a, start, limit, sticky)
+	return r.findAllSubmatchIndexUTF16(rt, a, start, limit, sticky)
 }
 
 func (r *regexp2Wrapper) clone() *regexp2Wrapper {
 	return &regexp2Wrapper{
-		rx: r.rx,
+		rx:      r.rx,
+		options: r.options,
 	}
 }
 
@@ -478,7 +506,7 @@ func (r *regexpObject) getLastIndex() int64 {
 func (r *regexpObject) execRegexp(target String) (match bool, result regexpResult) {
 	index := r.getLastIndex()
 	if index >= 0 && index <= int64(target.Length()) {
-		result = r.pattern.findSubmatchIndex(target, int(index))
+		result = r.pattern.findSubmatchIndex(r.val.runtime, target, int(index))
 	}
 	match = len(result.indexes) > 0 && (!r.pattern.sticky || int64(result.indexes[0]) == index)
 

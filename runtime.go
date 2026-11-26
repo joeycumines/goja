@@ -193,6 +193,7 @@ type Runtime struct {
 	now             Now
 	_collator       *collate.Collator
 	parserOptions   []parser.Option
+	regexpTimeLimit time.Duration
 
 	symbolRegistry map[unistring.String]*Symbol
 
@@ -2635,6 +2636,27 @@ func (r *Runtime) SetRandSource(source RandSource) {
 // If not called, the default time.Now() is used.
 func (r *Runtime) SetTimeSource(now Now) {
 	r.now = now
+}
+
+// SetRegexpTimeLimit sets an approximate time limit for each regular-expression
+// search. Zero (the default) disables the limit. Negative values and values over
+// 24 hours panic. The upper bound avoids overflow in the matcher's coarse clock.
+//
+// Exceeding the limit throws a catchable JavaScript RangeError. A pending
+// Interrupt or Abort takes precedence when matching returns. The limit applies
+// separately to each search for the next match, not to a complete global match,
+// replacement, script, compilation, or input conversion. Timeout checks use the
+// regexp2 clock (normally 100 ms granularity), so this is not a hard deadline or
+// a guarantee that native work responds immediately to cancellation.
+//
+// The policy also affects existing RegExp objects. It is local to this Runtime;
+// compiled Programs shared with other runtimes retain independent policies.
+// Call this method only on the runtime owner or while the Runtime is idle.
+func (r *Runtime) SetRegexpTimeLimit(limit time.Duration) {
+	if limit < 0 || limit > 24*time.Hour {
+		panic("goja: regexp time limit must be between zero and 24 hours")
+	}
+	r.regexpTimeLimit = limit
 }
 
 // SetParserOptions sets parser options to be used by RunString, RunScript and eval() within the code.

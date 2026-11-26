@@ -217,6 +217,22 @@ Goja uses [regexp2](https://github.com/dlclark/regexp2) library. There are a few
 mostly edge cases and should not affect general usage. See tc39_test.go for the list of exclusions. Any new
 incompatibilities should be reported as bugs.
 
+Matching may backtrack for an exponential amount of time. Hosts can opt into
+`Runtime.SetRegexpTimeLimit(duration)` to make an excessively long search throw
+a catchable JavaScript `RangeError`. The default is zero (unlimited); supported
+limits are zero through 24 hours. The limit is local to a runtime and affects
+existing RegExp objects without changing other runtimes that share a compiled
+Program. A private matcher is compiled lazily when a limit is first needed.
+
+This is an approximate budget for each search for the next match. It does not
+bound compilation, input conversion, output construction, a complete global
+operation, or a script. The matcher normally checks a clock with 100 ms
+granularity; scheduling can add further delay. A pending `Interrupt` or `Abort`
+takes precedence when matching returns and is also checked between successful
+matches. Neither cancellation method interrupts the middle of a native regexp
+search immediately. JavaScript can catch a timeout and retry, so a match limit
+is not a sandbox or a replacement for the host's overall execution policy.
+
 Exceptions
 ----------
 
