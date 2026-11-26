@@ -34,7 +34,7 @@ func TestVM1(t *testing.T) {
 			add,
 			setElem,
 			pop,
-			loadDynamic("v"),
+			loadDynamic{name: "v"},
 		},
 	}
 
@@ -87,6 +87,79 @@ func TestNewArrayFromIterClosed(t *testing.T) {
 	assert.sameValue(a, undefined);
 	assert(Array.isArray(other));
 	assert.sameValue(other.length, 0);
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestMulNegZero(t *testing.T) {
+	const SCRIPT = `
+		assert(Object.is(0 * -5, -0));
+		assert(Object.is(0 * -1, -0));
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// TestLogicalAssignSuspended tests logical assignments to variables on the
+// stack that suspend while their reference is held (d ||= await x, as in a
+// function inside one with a direct eval), whose stack is moved when the
+// function resumes.
+func TestLogicalAssignSuspended(t *testing.T) {
+	const SCRIPT = `
+	function outer() {
+		eval("");
+		async function f(a, b, c, d) { d ||= await Promise.resolve(5); return d; }
+		async function g(d) { let k = 1; try { d ??= k + await Promise.resolve(6); } catch (e) {} return d; }
+		function* gen(d) { d ||= yield 1; return d; }
+		return [f, g, gen];
+	}
+	const [f, g, gen] = outer();
+	const it = gen();
+	it.next();
+	return [await f(), await g(), await f(1, 2, 3, 4), it.next(9).value].join(" ");
+	`
+	testAsyncFunc(SCRIPT, asciiString("5 7 4 9"), t)
+}
+
+// TestThisStackRefMoved tests that a 'this' reference pointing at the stack follows its frame when the frame is
+// moved, as happens when a suspended vm is resumed. The compiler currently only emits resolveThisStack right before a
+// super() call, which consumes it immediately, but the reference must still not depend on the absolute position of the
+// frame on the stack.
+func TestThisStackRefMoved(t *testing.T) {
+	r := &Runtime{}
+	r.init()
+	vm := r.vm
+
+	vm.stack = make(valueStack, 8)
+	vm.sp = 4
+	vm.sb = 2
+	vm.stack[vm.sb] = nil
+
+	ref := &thisStackRef{vm: vm}
+
+	// Simulate suspend/resume: the frame is saved from sb-1 (the callee slot) and copied to a different position.
+	frame := append([]Value(nil), vm.stack[vm.sb-1:vm.sp]...)
+	newSp := 5
+	vm.sb = newSp + 1
+	vm.stack.expand(newSp + len(frame))
+	copy(vm.stack[newSp:], frame)
+	vm.sp = newSp + len(frame)
+
+	v := r.NewObject()
+	ref.set(v)
+
+	if got := vm.stack[vm.sb]; got != v {
+		t.Fatalf("'this' was written to the wrong stack slot: %v", got)
+	}
+	if got := ref.get(); got != v {
+		t.Fatalf("unexpected 'this' value: %v", got)
+	}
+}
+
+func TestUnaryMinusToNumeric(t *testing.T) {
+	const SCRIPT = `
+	let n = 0;
+	assert.sameValue(-{ toString() { n++; return "b"; } }, NaN);
+	assert.sameValue(n, 1);
 	`
 	testScriptWithTestLib(SCRIPT, _undefined, t)
 }

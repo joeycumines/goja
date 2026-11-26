@@ -173,6 +173,14 @@ func TestBinOctalNumbers(t *testing.T) {
 	testScript(SCRIPT, valueInt(7), t)
 }
 
+func TestNonOctalDecimalNumbers(t *testing.T) {
+	const SCRIPT = `
+	08 === 8 && 019 === 19 && 09.5 === 9.5 && 08e1 === 80 && 017 === 15;
+	`
+
+	testScript(SCRIPT, valueTrue, t)
+}
+
 func TestSetFunc(t *testing.T) {
 	const SCRIPT = `
 	sum(40, 2);
@@ -1129,6 +1137,17 @@ func TestRuntime_SetGlobalObject_Proxy(t *testing.T) {
 	globalObject := vm.GlobalObject()
 
 	globalObjectProxy := vm.NewProxy(globalObject, &ProxyTrapConfig{
+		Has: func(target *Object, property string) (available bool) {
+			if target != globalObject {
+				t.Fatal("Expected target to be global object")
+			}
+
+			if property == "testing" {
+				return true
+			}
+
+			return target.hasProperty(vm.ToValue(property))
+		},
 		Get: func(target *Object, property string, receiver Value) (value Value) {
 			if target != globalObject {
 				t.Fatal("Expected target to be global object")
@@ -1151,6 +1170,14 @@ func TestRuntime_SetGlobalObject_Proxy(t *testing.T) {
 
 	if ret != valueTrue {
 		t.Fatal("Expected return value to equal true")
+	}
+
+	// Per the GetBindingValue(N, S) semantics of the global object environment record,
+	// resolution is gated by HasProperty(bindingObject, N), so a name the proxy does not
+	// report as existing must throw a ReferenceError even though a 'get' trap could serve it.
+	_, err = vm.RunString("nonexistent")
+	if err == nil {
+		t.Fatal("Expected ReferenceError for a non-existent global")
 	}
 }
 
@@ -1392,6 +1419,13 @@ func TestSortComparatorReturnValueNegZero(t *testing.T) {
 	}
 	`
 	testScript(SCRIPT, _undefined, t)
+}
+
+func TestObjectToLocaleStringNoToString(t *testing.T) {
+	const SCRIPT = `
+	assert.throws(TypeError, () => Object.prototype.toLocaleString.call(Object.create(null)));
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
 }
 
 func TestNilApplyArg(t *testing.T) {
@@ -1893,6 +1927,280 @@ func TestInterruptWithPromises(t *testing.T) {
 	var soErr *InterruptedError
 	if !errors.As(err, &soErr) {
 		t.Fatalf("Wrong error type: %T", err)
+	}
+}
+
+// When an async function or a generator is aborted (an Interrupt, a StackOverflowError, ...) while it is running,
+// the frames pushed on entry must not be left on the call stack / try stack. If they are, the runtime never
+// considers itself "left" again (len(vm.callStack) != 0), so the job queue is never drained: every later await
+// continuation and promise reaction silently stops running.
+
+func assertNoLeakedFrames(t *testing.T, r *Runtime) {
+	t.Helper()
+	if l := len(r.vm.callStack); l != 0 {
+		t.Errorf("call stack is not empty: %d frame(s) left", l)
+	}
+	if l := len(r.vm.tryStack); l != 0 {
+		t.Errorf("try stack is not empty: %d frame(s) left", l)
+	}
+	r.SetMaxCallStackSize(1024)
+	_, err := r.RunString(`
+		var reacted = false, resumed = false;
+		Promise.resolve().then(() => { reacted = true });
+		(async function() { await null; resumed = true; })();
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Get("reacted").ToBoolean() {
+		t.Error("promise reaction did not run")
+	}
+	if !r.Get("resumed").ToBoolean() {
+		t.Error("await continuation did not run")
+	}
+}
+
+func TestInterruptInAsyncOrGeneratorDoesNotLeakFrames(t *testing.T) {
+	const haltingIterable = `
+		function haltingIterable() {
+			return {
+				[Symbol.iterator]() { return this; },
+				next() { return { value: 1, done: false }; },
+				return() { halt(); return {}; },
+			};
+		}
+	`
+	tests := []struct {
+		name  string
+		setup string // must define a global function trigger(); halt() interrupts the runtime
+	}{
+		{"async function before first await", `
+			async function trigger() { halt(); }`},
+		{"nested async function", `
+			async function inner() { halt(); }
+			async function trigger() { await inner(); }`},
+		{"async function after await", `
+			async function trigger() { await null; halt(); }`},
+		{"async function after rejected await", `
+			async function trigger() { try { await Promise.reject(1); } catch (e) { halt(); } }`},
+		{"async function resolving a thenable result", `
+			async function trigger() { return { get then() { halt(); } }; }`},
+		{"generator parameter initialiser", `
+			function* g(a = halt()) {}
+			function trigger() { g(); }`},
+		{"generator next", `
+			function* g() { halt(); yield 1; }
+			function trigger() { g().next(); }`},
+		{"generator throw closing an iterator", haltingIterable + `
+			function* g() { for (const x of haltingIterable()) yield x; }
+			var it = g();
+			it.next();
+			function trigger() { it.throw(1); }`},
+		{"generator return running finally", `
+			function* g() { try { yield 1; } finally { halt(); } }
+			var it = g();
+			it.next();
+			function trigger() { it.return(); }`},
+		{"generator return closing an iterator inside try-finally", haltingIterable + `
+			function* g() { try { for (const x of haltingIterable()) yield x; } finally {} }
+			var it = g();
+			it.next();
+			function trigger() { it.return(); }`},
+	}
+	entries := []struct {
+		name string
+		call func(r *Runtime) error
+	}{
+		{"callable", func(r *Runtime) error {
+			trigger, ok := AssertFunction(r.Get("trigger"))
+			if !ok {
+				return errors.New("trigger is not a function")
+			}
+			_, err := trigger(nil)
+			return err
+		}},
+		{"RunString", func(r *Runtime) error {
+			_, err := r.RunString(`trigger()`)
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		for _, entry := range entries {
+			t.Run(tc.name+"/"+entry.name, func(t *testing.T) {
+				r := New()
+				r.Set("halt", func() { r.Interrupt("halt") })
+				if _, err := r.RunString(tc.setup); err != nil {
+					t.Fatal(err)
+				}
+				err := entry.call(r)
+				var iErr *InterruptedError
+				if !errors.As(err, &iErr) {
+					t.Fatalf("expected *InterruptedError, got %T: %v", err, err)
+				}
+				r.ClearInterrupt()
+				assertNoLeakedFrames(t, r)
+			})
+		}
+	}
+}
+
+func TestStackOverflowInAsyncOrGeneratorDoesNotLeakFrames(t *testing.T) {
+	scripts := map[string]string{
+		"async function":                  `async function f() {} function walk() { f(); walk(); }`,
+		"generator":                       `function* f() {} function walk() { f(); walk(); }`,
+		"generator with parameter values": `function* f(a = 1) {} function walk() { f(); walk(); }`,
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			// The overflow hits a different push depending on the limit; scan a range so that the pushes made by
+			// asyncRunner.start() / generatorObject.init() are hit too.
+			for size := 1; size <= 32; size++ {
+				r := New()
+				r.SetMaxCallStackSize(size)
+				if _, err := r.RunString(script); err != nil {
+					t.Fatal(err)
+				}
+				_, err := r.RunString(`walk()`)
+				var soErr *StackOverflowError
+				if !errors.As(err, &soErr) {
+					t.Fatalf("max call stack size %d: expected *StackOverflowError, got %T: %v", size, err, err)
+				}
+				if l := len(r.vm.callStack); l != 0 {
+					t.Fatalf("max call stack size %d: call stack is not empty: %d frame(s) left", size, l)
+				}
+				assertNoLeakedFrames(t, r)
+			}
+		})
+	}
+}
+
+// A regular exception thrown from Go code while an async function's result is being settled (here: reading the
+// constructor of the awaited promise) must not leave frames behind either. Per spec it should reject the promise
+// returned by f(); this test only checks that the runtime stays usable.
+func TestExceptionWhileAwaitingDoesNotLeakFrames(t *testing.T) {
+	r := New()
+	_, _ = r.RunString(`
+		const p = Promise.resolve();
+		Object.defineProperty(p, "constructor", { get() { throw new Error("boom"); } });
+		async function f() { await p; }
+		try { f(); } catch (e) {}
+	`)
+	assertNoLeakedFrames(t, r)
+}
+
+func TestExceptionWhileAwaitingRejectsPromise(t *testing.T) {
+	const SCRIPT = `
+		const p = Promise.resolve();
+		const err = new Error("boom");
+		Object.defineProperty(p, "constructor", { get() { throw err; } });
+		async function f() { await p; }
+		let caught;
+		f().catch(e => caught = e);
+		undefined;
+	`
+	r := New()
+	r.testScript(SCRIPT, _undefined, t)
+	if caught := r.Get("caught"); caught != r.Get("err") {
+		t.Fatal(caught)
+	}
+}
+
+// An exception thrown by PromiseResolve() during an await is a throw completion at the await expression,
+// so it must be catchable by the async function itself.
+func TestExceptionWhileAwaitingIsCaught(t *testing.T) {
+	const SCRIPT = `
+		const p = Promise.resolve();
+		const err = new Error("boom");
+		Object.defineProperty(p, "constructor", { get() { throw err; } });
+		let caught, finallyRan = false;
+		async function f() {
+			try {
+				await p;
+				return "normal";
+			} catch (e) {
+				caught = e;
+				return "caught";
+			} finally {
+				finallyRan = true;
+			}
+		}
+		let value;
+		f().then(v => value = v);
+		undefined;
+	`
+	r := New()
+	r.testScript(SCRIPT, _undefined, t)
+	if caught := r.Get("caught"); caught != r.Get("err") {
+		t.Fatalf("caught %v, expected err", caught)
+	}
+	if !r.Get("finallyRan").ToBoolean() {
+		t.Fatal("finally block was not executed")
+	}
+	if value := r.Get("value"); value == nil || value.String() != "caught" {
+		t.Fatalf("result: %v, expected \"caught\"", value)
+	}
+	assertNoLeakedFrames(t, r)
+}
+
+func TestExceptionWhileAwaitingRunsFinally(t *testing.T) {
+	const SCRIPT = `
+		const p = Promise.resolve();
+		const err = new Error("boom");
+		Object.defineProperty(p, "constructor", { get() { throw err; } });
+		let finallyRan = false, rejected;
+		async function f() {
+			try {
+				await p;
+			} finally {
+				finallyRan = true;
+			}
+		}
+		f().catch(e => rejected = e);
+		undefined;
+	`
+	r := New()
+	r.testScript(SCRIPT, _undefined, t)
+	if !r.Get("finallyRan").ToBoolean() {
+		t.Fatal("finally block was not executed")
+	}
+	if rejected := r.Get("rejected"); rejected != r.Get("err") {
+		t.Fatalf("rejected %v, expected err", rejected)
+	}
+}
+
+func TestExceptionWhileAwaitingCanBeCaughtAndAwaitedAgain(t *testing.T) {
+	const SCRIPT = `
+		const p1 = Promise.resolve();
+		const p2 = Promise.resolve();
+		const err1 = new Error("boom1");
+		const err2 = new Error("boom2");
+		Object.defineProperty(p1, "constructor", { get() { throw err1; } });
+		Object.defineProperty(p2, "constructor", { get() { throw err2; } });
+		let caught1, caught2;
+		async function f() {
+			try {
+				await p1;
+			} catch (e1) {
+				caught1 = e1;
+				try {
+					await p2;
+				} catch (e2) {
+					caught2 = e2;
+					return "ok";
+				}
+			}
+		}
+		let value;
+		f().then(v => value = v);
+		undefined;
+	`
+	r := New()
+	r.testScript(SCRIPT, _undefined, t)
+	if caught1, caught2 := r.Get("caught1"), r.Get("caught2"); caught1 != r.Get("err1") || caught2 != r.Get("err2") {
+		t.Fatalf("caught %v, %v, expected err1, err2", caught1, caught2)
+	}
+	if value := r.Get("value"); value == nil || value.String() != "ok" {
+		t.Fatalf("result: %v, expected \"ok\"", value)
 	}
 }
 
@@ -2673,6 +2981,9 @@ func TestStrToInt32(t *testing.T) {
 	if n, ok := strToInt32("-01"); ok {
 		t.Fatal("-01", n, ok)
 	}
+	if n, ok := strToInt32("-"); ok {
+		t.Fatal("-", n, ok)
+	}
 }
 
 func TestDestructSymbol(t *testing.T) {
@@ -2683,6 +2994,27 @@ func TestDestructSymbol(t *testing.T) {
 	({[S]: s, ...rest} = {[S]: true, test: 1});
 	assert.sameValue(s, true, "S");
 	assert(deepEqual(rest, {test: 1}), "rest");
+	`
+	testScriptWithTestLibX(SCRIPT, _undefined, t)
+}
+
+func TestDestructObjectRestNestedPattern(t *testing.T) {
+	const SCRIPT = `
+	var a, b, c, r, src;
+
+	src = {x: 1, y: 2};
+	r = ({...{x: a}} = src);
+	assert.sameValue(a, 1, "nested object pattern");
+	assert.sameValue(r, src, "result");
+
+	src = {[Symbol.iterator]: function*() { yield 7; }};
+	r = ({...[b]} = src);
+	assert.sameValue(b, 7, "nested array pattern");
+	assert.sameValue(r, src, "result");
+
+	for ({...{x: c}} of [{x: 3}]) {
+		assert.sameValue(c, 3, "for-of");
+	}
 	`
 	testScriptWithTestLibX(SCRIPT, _undefined, t)
 }
@@ -2956,6 +3288,43 @@ func TestNestedTopLevelConstructorPanicAsync(t *testing.T) {
 	}
 }
 
+func TestPromiseResolveNonPromise(t *testing.T) {
+	const SCRIPT = `
+	var o = {constructor: Promise};
+	var p = Promise.resolve(o);
+	assert(p !== o);
+	assert.sameValue(await p, o);
+	assert.sameValue(await o, o);
+	`
+	testAsyncFuncWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestPromiseTry(t *testing.T) {
+	const SCRIPT = `
+	var p = Promise.resolve(1);
+	assert.sameValue(Promise.try(function () { return p; }), p, "returned promise is passed through");
+
+	var called = false;
+	var Ctor = function () { throw new Test262Error(); };
+	assert.throws(Test262Error, function () {
+		Promise.try.call(Ctor, function () { called = true; });
+	});
+	assert(called, "callback is called before the constructor");
+
+	var err = new Error();
+	var rejected = Promise.try(function () { throw err; });
+	assert(rejected instanceof Promise);
+	try {
+		await rejected;
+		assert(false, "should have been rejected");
+	} catch (e) {
+		assert.sameValue(e, err);
+	}
+	assert.sameValue(await Promise.try(function (a, b) { return a + b; }, 1, 2), 3);
+	`
+	testAsyncFuncWithTestLib(SCRIPT, _undefined, t)
+}
+
 func TestAsyncFuncThrow(t *testing.T) {
 	const SCRIPT = `
 	class TestError extends Error {
@@ -3104,6 +3473,24 @@ func TestToNumber(t *testing.T) {
 	assert.sameValue(Number(" "), 0);
 	assert.sameValue(Number(" Infinity"), Infinity);
 
+	assert.sameValue(Number("0x8000000000000000"), 2 ** 63, "2^63");
+	assert.sameValue(Number("0xffffffffffffffff"), 2 ** 64, "2^64-1");
+	assert.sameValue(Number("0XFFFFFFFFFFFFFFFF"), 2 ** 64, "uppercase");
+	assert.sameValue(+"0x10000000000000800", 2 ** 64, "tie rounds to even (down)");
+	assert.sameValue(+"0x10000000000001800", 2 ** 64 + 8192, "tie rounds to even (up)");
+	assert.sameValue(Number("0b" + "1".repeat(64)), 2 ** 64, "binary");
+	assert.sameValue(Number("0B" + "1".repeat(64)), 2 ** 64, "binary uppercase");
+	assert.sameValue(Number("0o1777777777777777777777"), 2 ** 64, "octal");
+	assert.sameValue(Number("0O1777777777777777777777"), 2 ** 64, "octal uppercase");
+	assert.sameValue(Number("0x" + "f".repeat(256)), Infinity, "Infinity");
+	assert.sameValue(Math.max("0xffffffffffffffff"), 2 ** 64, "ToFloat()");
+	assert(isNaN(Number("0x")));
+	assert(isNaN(Number("1x" + "f".repeat(16))));
+	assert(isNaN(Number("0x-ffffffffffffffff")));
+	assert(isNaN(Number("0x+ffffffffffffffff")));
+	assert(isNaN(Number("0xffffffffffffffffg")));
+	assert(isNaN(Number("0z" + "1".repeat(64))));
+
 	let a = [1];
 	assert.sameValue(1, a.at("0xfp1"));
 	assert.sameValue(1, a.at(" 0xfp1"));
@@ -3130,6 +3517,661 @@ func TestClassReexport(t *testing.T) {
 	const c = new m.C() // 'm.C' does ToValue()
 	c instanceof C && c.test;
 	`, valueTrue, t)
+}
+
+func TestGoIterator(t *testing.T) {
+	t.Run("return", func(t *testing.T) {
+		iterSeq := func(yield func(string) bool) {
+			if !yield("one") {
+				t.Fatal("yield(1)")
+			}
+			if yield("two") {
+				t.Fatal("yield(2)")
+			}
+		}
+		vm := New()
+		vm.Set("iterSeq", iterSeq)
+		_, err := vm.RunString(`
+			let count = 0;
+			for (const label of iterSeq) {
+				if (++count === 2) {
+					break;
+				}
+			}
+		`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+	})
+
+	t.Run("faulty", func(t *testing.T) {
+		returned := false
+		iterSeq := func(yield func(string, error) bool) {
+			defer func() {
+				returned = true
+			}()
+			if !yield("1", nil) {
+				return
+			}
+			if !yield("", errors.New("error")) { // yield should return false
+				return
+			}
+			panic("should not get here")
+		}
+		vm := New()
+		vm.Set("iterSeq", iterSeq)
+		_, err := vm.RunString(`
+			let caught;
+			try {
+				for (const label of iterSeq) {
+					res += label;
+				}
+			} catch(e) {
+				caught = e;
+			}
+			if (!caught) {
+				throw new Error("Expected exception");
+			}
+		`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !returned {
+			t.Fatal("Not returned")
+		}
+	})
+
+	t.Run("yielding nil", func(t *testing.T) {
+		iterSeq := func(yield func(any) bool) {
+			yield(nil)
+		}
+
+		vm := New()
+		vm.Set("iterSeq", iterSeq)
+		vm.testScriptWithTestLib(`
+			let count = 0;
+			for (const label of iterSeq) {
+				assert.sameValue(label, null);
+				count++;
+			}
+			assert.sameValue(count, 1);
+		`, _undefined, t)
+	})
+
+	t.Run("nil iterator", func(t *testing.T) {
+		var iterSeq func(func(string) bool)
+
+		vm := New()
+		vm.Set("iterSeq", iterSeq)
+		vm.testScriptWithTestLib(`
+			assert.throws(TypeError, () => {
+				for (const label of iterSeq) {
+				}
+			});
+		`, _undefined, t)
+	})
+
+	t.Run("delegate-return", func(t *testing.T) {
+		var returnedAt int
+		iterSeq := func() func(func(int) bool) {
+			return func(yield func(int) bool) {
+				for i := range 5 {
+					if !yield(i) {
+						returnedAt = i
+						return
+					}
+				}
+			}
+		}
+		vm := New()
+		vm.Set("iterSeq", iterSeq)
+		vm.testScriptWithTestLib(`
+			function* g() {
+				yield -1;
+				yield* iterSeq();
+			}
+
+			let count = -1;
+			for (const val of g()) {
+				assert.sameValue(val, count);
+				if (count === 2) {
+					break;
+				}
+				count++;
+			}
+		`, _undefined, t)
+		if returnedAt != 2 {
+			t.Fatal(returnedAt)
+		}
+	})
+
+	t.Run("over-iterate", func(t *testing.T) {
+		vm := New()
+		next := vm.getIterator(vm.ToValue(func(yield func(int) bool) {}), nil).next
+
+		vm.Set("next", next)
+		vm.testScriptWithTestLib(`
+			let res = next();
+			assert(res.done);
+			res = next();
+			assert(res.done);
+		`, _undefined, t)
+	})
+
+	t.Run("panic-exception", func(t *testing.T) {
+		vm := New()
+		iterSeq := func(yield func(any) bool) {
+			panic(vm.NewTypeError("test"))
+		}
+
+		vm.Set("iterSeq", iterSeq)
+		vm.testScriptWithTestLib(`
+			assert.throws(TypeError, () => {
+				for (const label of iterSeq) {
+				}
+				throw new Error("should not get here");
+			});
+		`, _undefined, t)
+	})
+
+	t.Run("reuse", func(t *testing.T) {
+		vm := New()
+		iterSeq := func(yield func(int) bool) {
+			for i := range 2 {
+				if !yield(i) {
+					return
+				}
+			}
+		}
+
+		vm.Set("iterSeq", iterSeq)
+		vm.testScript(`
+			let buf = "";
+			for (const i of iterSeq) {
+				buf += i;
+			}
+			for (const i of iterSeq) {
+				buf += i;
+			}
+		`, asciiString("0101"), t)
+	})
+
+	t.Run("is-iterable", func(t *testing.T) {
+		vm := New()
+		iterSeq := func(yield func(int) bool) {
+			for i := range 2 {
+				if !yield(i) {
+					return
+				}
+			}
+		}
+		vm.Set("iterSeq", iterSeq)
+		vm.testScript(`
+		function isIterable(value) {
+			if (value == null) return false;
+  			return typeof value[Symbol.iterator] === 'function';
+		}
+
+		isIterable(iterSeq);
+		`, valueTrue, t)
+	})
+
+}
+
+func ExampleRuntime_ToValue_seq() {
+	iterSeq := func(yield func(int) bool) {
+		for i := range 3 {
+			if !yield(i) {
+				return
+			}
+		}
+	}
+
+	vm := New()
+	vm.Set("iterSeq", iterSeq)
+	res, err := vm.RunString(`
+		let res = "";
+		for (const label of iterSeq) {
+			res += label;
+		}
+	`)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(res.String())
+	// Output: 012
+}
+
+func ExampleRuntime_ToValue_seq2() {
+	iterSeq := func(yield func(string, string) bool) {
+		vals := [][2]string{
+			{"admin", "full access"},
+			{"user", "minimal access"},
+		}
+		for _, val := range vals {
+			if !yield(val[0], val[1]) {
+				return
+			}
+		}
+	}
+
+	vm := New()
+	vm.Set("iterSeq", iterSeq)
+	res, err := vm.RunString(`
+		let res = "";
+		for (const [role, level] of iterSeq) {
+			res += "{role: "+role+", level: "+level+"}";
+		}
+	`)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(res.String())
+	// Output: {role: admin, level: full access}{role: user, level: minimal access}
+}
+
+func ExampleRuntime_ToValue_seq2err() {
+	vm := New()
+	iterSeq := func(yield func(string, error) bool) {
+		if !yield("1", nil) {
+			return
+		}
+		if !yield("", errors.New("error")) {
+			return
+		}
+	}
+
+	vm.Set("iterSeq", iterSeq)
+	res, err := vm.RunString(`
+		let res = "";
+		try {
+			for (const label of iterSeq) {
+				res += label;
+			}
+		} catch(e) {
+			res += "!"+e.toString();
+		}
+	`)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(res.String())
+	// Output: 1!GoError: error
+}
+
+func TestObjectRedefinePropertyNonConfigurable(t *testing.T) {
+	const SCRIPT = `
+	var o = {};
+	Object.defineProperty(o, "x", {value: 1});
+
+	assert.throws(TypeError, () => {
+		Object.defineProperty(o, "x", {get: undefined});
+	});
+	assert(deepEqual(Object.getOwnPropertyDescriptor(o, "x"), { value: 1, writable: false, enumerable: false, configurable: false }));
+
+	var p = {};
+	var getter = function() {}
+	Object.defineProperty(p, "x", {get: getter});
+	assert.throws(TypeError, () => {
+		Object.defineProperty(p, "x", {writable: false});
+	});
+	assert(deepEqual(Object.getOwnPropertyDescriptor(p, "x"), { get: getter, set: undefined, enumerable: false, configurable: false }));
+	`
+	testScriptWithTestLibX(SCRIPT, _undefined, t)
+}
+
+func TestRedefineWritableAsGetterOnly(t *testing.T) {
+	const SCRIPT = `
+	"use strict";
+	var o = { p: 1 };
+	Object.defineProperty(o, "p", { get() { return 1; } });
+	assert(!Reflect.set(o, "p", 2));
+	assert.throws(TypeError, () => {o.p = 2});
+	`
+	testScriptWithTestLibX(SCRIPT, _undefined, t)
+}
+
+func TestRedefineAccessorAsDataProperty(t *testing.T) {
+	const SCRIPT = `
+	"use strict";
+	var o = {};
+	Object.defineProperty(o, "p", { get() { return 42; }, configurable: true });
+	Object.defineProperty(o, "p", { writable: true });
+	assert.sameValue(Object.getOwnPropertyDescriptor(o, "p").value, undefined);
+	assert.sameValue(Object.getOwnPropertyDescriptor(o, "p").writable, true);
+	assert.sameValue(Object.getOwnPropertyDescriptor(o, "p").get, undefined);
+	assert.sameValue(Object.getOwnPropertyDescriptor(o, "p").set, undefined);
+	assert.sameValue(o.p, undefined);
+	o.p = 5;
+	assert.sameValue(o.p, 5);
+
+	var p = {};
+	Object.defineProperty(p, "q", { get() { return 1; }, configurable: true });
+	Object.defineProperty(p, "q", { writable: false });
+	assert.sameValue(Object.getOwnPropertyDescriptor(p, "q").value, undefined);
+	assert.sameValue(p.q, undefined);
+
+	var q = {};
+	Object.defineProperty(q, "r", { set(v) {}, configurable: true });
+	Object.defineProperty(q, "r", { value: 2 });
+	assert.sameValue(Object.getOwnPropertyDescriptor(q, "r").writable, false);
+	assert.sameValue(q.r, 2);
+	`
+	testScriptWithTestLibX(SCRIPT, _undefined, t)
+}
+
+func TestWithUnscopables(t *testing.T) {
+	const SCRIPT = `
+	var unscopablesCalled = 0;
+	
+	var env = {
+	  binding: 0,
+	  get [Symbol.unscopables]() {
+		unscopablesCalled++;
+		delete env.binding;
+		return null;
+	  }
+	};
+	
+	var result = null;
+	with (env) {
+	  assert.throws(ReferenceError, function() {
+		"use strict";
+		result = binding;
+	  });
+	}
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// Like TestWithUnscopables, but the deleted binding is shadowed dynamically while a statically
+// known binding of the same name exists in an outer function scope. This forces the loadMixed
+// instruction family (instead of loadDynamic) to scan the 'with' object stash.
+func TestWithUnscopablesMixedScopes(t *testing.T) {
+	const SCRIPT = `
+	var unscopablesCalled = 0;
+
+	function newEnv() {
+	  return {
+		binding: 0,
+		get [Symbol.unscopables]() {
+		  unscopablesCalled++;
+		  delete this.binding;
+		  return null;
+		}
+	  };
+	}
+
+	var result = null;
+
+	function testVar() {
+	  var binding = 1;
+	  with (newEnv()) {
+		assert.throws(ReferenceError, function() {
+		  "use strict";
+		  result = binding;
+		});
+	  }
+	}
+	testVar();
+
+	function testLex() {
+	  let binding = 1;
+	  with (newEnv()) {
+		assert.throws(ReferenceError, function() {
+		  "use strict";
+		  result = binding;
+		});
+	  }
+	}
+	testLex();
+
+	function testCallee() {
+	  function binding() {}
+	  with (newEnv()) {
+		assert.throws(ReferenceError, function() {
+		  "use strict";
+		  binding();
+		});
+	  }
+	}
+	testCallee();
+
+	// non-strict GetBindingValue returns undefined rather than the outer binding
+	function testNonStrict() {
+	  var binding = 1;
+	  var result2;
+	  with (newEnv()) {
+		result2 = binding;
+	  }
+	  assert.sameValue(result2, undefined);
+	}
+	testNonStrict();
+
+	// control: while the binding still exists the with object shadows the outer one
+	function testPresent() {
+	  var binding = 1;
+	  var result2;
+	  with ({ binding: 99 }) {
+		result2 = (function() { "use strict"; return binding; })();
+	  }
+	  assert.sameValue(result2, 99);
+	}
+	testPresent();
+
+	assert.sameValue(unscopablesCalled, 4, "get [Symbol.unscopables] called once per access");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestWithDeleteShadowedBindingScanDepth(t *testing.T) {
+	// develeVar should stop after scanning one level (the inner 'with'), return false, and outer.binding
+	// should not be deleted.
+	const SCRIPT = `
+	const outer = {binding: 1};
+	function t() {
+		with (outer) {
+			let binding = 2;
+			with ({}) {
+				return delete binding;
+			}
+		}
+	}
+	!t() && outer.binding === 1;
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+// 'delete x' inside a 'with' statement must resolve the name dynamically: if the 'with' object has
+// the property it is deleted from the object (even if a statically known binding of the same name
+// exists in an enclosing scope); if it does not, the statically known binding is not deletable and
+// the result is false.
+func TestWithDeleteShadowedBinding(t *testing.T) {
+	const SCRIPT = `
+	var result = null;
+
+	function testShadowed() {
+	  var binding = 1;
+	  var out;
+	  with ({ binding: 2 }) {
+		out = [delete binding, binding];
+	  }
+	  assert(Array.isArray(out) && out[0] === true && out[1] === 1, "shadowed: " + out);
+	  assert.sameValue(binding, 1, "outer binding not modified");
+	}
+	testShadowed();
+
+	function testNotShadowed() {
+	  var binding = 1;
+	  var out;
+	  with ({}) {
+		out = delete binding;
+	  }
+	  assert.sameValue(out, false, "not shadowed: var is not deletable");
+	  assert.sameValue(binding, 1, "outer binding not modified");
+	}
+	testNotShadowed();
+
+	function testLet() {
+	  let binding = 1;
+	  var out;
+	  with ({ binding: 2 }) {
+		out = delete binding;
+	  }
+	  assert.sameValue(out, true, "let: property on the with object is deletable");
+	}
+	testLet();
+
+	function testNonConfigurable() {
+	  var env = {};
+	  Object.defineProperty(env, "binding", { value: 2, configurable: false });
+	  var out;
+	  with (env) {
+		out = delete binding;
+	  }
+	  assert.sameValue(out, false, "non-configurable property is not deletable");
+	}
+	testNonConfigurable();
+
+	function testUnscopablesHidden() {
+	  var binding = 1;
+	  var env = { binding: 2, get [Symbol.unscopables]() { return { binding: true }; } };
+	  var out;
+	  with (env) {
+		out = delete binding;
+	  }
+	  assert.sameValue(out, false, "binding hidden by unscopables resolves to the outer var");
+	  assert.sameValue(env.binding, 2, "the property is not deleted");
+	}
+	testUnscopablesHidden();
+
+	function testProxyEnv() {
+	  var deleted = null;
+	  var env = new Proxy({ p: 1 }, {
+		deleteProperty: function(t, pk) {
+		  deleted = pk;
+		  return Reflect.deleteProperty(t, pk);
+		},
+	  });
+	  var out;
+	  with (env) {
+		out = delete p;
+	  }
+	  assert.sameValue(out, true, "proxy with-env: property deleted");
+	  assert.sameValue(deleted, "p", "deleteProperty trap called");
+	}
+	testProxyEnv();
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// 'delete' of names created or redeclared by eval code.
+// Global var bindings created or redeclared by eval are object properties consulted at runtime
+// (deletable if the eval created them as configurable, not if they pre-existed as
+// non-configurable); function-level bindings created by non-strict eval are deletable.
+func TestDeleteEvalBindings(t *testing.T) {
+	const SCRIPT = `
+	var out = [];
+
+	// eval redeclares a global var (non-configurable property): not deletable, property survives
+	var g1; eval("var g1 = 2");
+	var r1, r2;
+	with ({}) { r1 = delete g1; }
+	r2 = delete g1;
+	out.push(r1 + "," + r2 + "," + ("g1" in this) + "," + g1);
+
+	// eval creates a fresh global var: configurable, deletable (also from within the eval)
+	out.push(eval("var g2 = 2; delete g2") + "|" + (typeof g2));
+	out.push(eval("var g3 = 2") + "|" + delete g3 + "|" + ("g3" in this));
+
+	// eval redeclares and deletes inside the eval: existing non-configurable property survives
+	var g4; out.push(eval("var g4 = 2; delete g4") + "|" + g4);
+
+	// non-strict eval inside a function: function-level binding, deletable, no global leak
+	var r5, r6, r7;
+	function f5() {
+	  eval("var g5 = 2");
+	  with ({}) { r5 = delete g5; }
+	  r6 = (typeof globalThis.g5 === "undefined");
+	}
+	f5();
+	function f6() { return eval("var g6 = 2; delete g6"); }
+	r7 = f6() + "|" + (typeof globalThis.g6 === "undefined");
+	out.push(r5 + "|" + r6 + "|" + r7);
+
+	// static function-level binding + eval redeclaration: existing binding is kept, not deletable
+	function f7() {
+	  var g7 = 1;
+	  eval("var g7 = 2");
+	  with ({}) { return [delete g7, g7].join(","); }
+	}
+	out.push(f7());
+
+	// strict eval inside a with: own scope, nothing visible, no leak, unresolvable delete is true
+	var r8;
+	function f8() {
+	  with ({}) {
+		eval("'use strict'; var g8 = 2");
+		r8 = [typeof g8, delete g8, (typeof globalThis.g8 === "undefined")].join(",");
+	  }
+	}
+	f8();
+	out.push(r8);
+
+	out.join(";")
+	`
+	testScript(SCRIPT, asciiString(
+		"false,false,true,2;"+
+			"true|undefined;"+
+			"undefined|true|false;"+
+			"false|2;"+
+			"true|true|true|true;"+
+			"false,2;"+
+			"undefined,true,true"), t)
+}
+
+func TestStrToIntLoneDash(t *testing.T) {
+	const SCRIPT = `
+	""["-"];
+	`
+	testScript(SCRIPT, _undefined, t)
+}
+
+func TestObjectFromEmptyArray(t *testing.T) {
+	const SCRIPT = `
+	const o = Object.fromEntries([[]]);
+	o.hasOwnProperty("undefined") && o.undefined === undefined;
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestToInt32LargeFloat(t *testing.T) {
+	vm := New()
+	v, err := vm.RunString(`
+		(Math.pow(2, 63) | 0) + "," +
+		(Math.pow(2, 63) >>> 0) + "," +
+		(1e20 | 0) + "," +
+		(-1e20 | 0) + "," +
+		((Math.pow(2, 63) + Math.pow(2, 31)) | 0) + "," +
+		((Math.pow(2, 32) + 1) | 0) + "," +
+		(-1.9 | 0) + "," +
+		String.fromCharCode(Math.pow(2, 63)).charCodeAt(0)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "0,0,1661992960,-1661992960,-2147483648,1,-1,0"
+	if got := v.String(); got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+func TestPromiseReactionNilThis(t *testing.T) {
+	const SCRIPT = `
+	void Promise.resolve().finally(Array.prototype.findLast);
+	`
+	testScript(SCRIPT, _undefined, t)
 }
 
 /*
@@ -3260,9 +4302,57 @@ func BenchmarkAsciiStringMapGet(b *testing.B) {
 	}
 }
 
+func BenchmarkToInt32Float(b *testing.B) {
+	b.Run("fast", func(b *testing.B) {
+		f := float64(1)
+		for b.Loop() {
+			floatToUint32(f)
+		}
+	})
+
+	b.Run("slow", func(b *testing.B) {
+		f := float64(math.MaxUint64)
+		for b.Loop() {
+			floatToUint32(f)
+		}
+	})
+}
+
 func BenchmarkNew(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		New()
+	}
+}
+
+func BenchmarkGoIteratorForOf(b *testing.B) {
+	iterSeq := func(yield func(Value) bool) {
+		for range 110 {
+			yield(valueTrue)
+		}
+	}
+
+	vm := New()
+	vm.Set("iterSeq", iterSeq)
+	prg := MustCompile("test.js", `
+		{
+			let count = 0;
+			for (const v of iterSeq) {
+				if (v !== true) {
+					throw new Error(v);
+				}
+				count++;
+			}
+			if (count !== 110) {
+					throw new Error(count);
+			}
+		}
+	`, true)
+	b.ReportAllocs()
+	for b.Loop() {
+		_, err := vm.RunProgram(prg)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

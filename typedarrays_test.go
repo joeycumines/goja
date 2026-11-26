@@ -2,7 +2,13 @@ package goja
 
 import (
 	"bytes"
+	stdbase64 "encoding/base64"
+	stdhex "encoding/hex"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
+	"unsafe"
 )
 
 func TestUint16ArrayObject(t *testing.T) {
@@ -281,6 +287,35 @@ func TestTypedArrayDefinePropDetachedBuffer(t *testing.T) {
 	vm.testScriptWithTestLib(SCRIPT, _undefined, t)
 }
 
+func TestArrayBufferSliceDetachedZeroLen(t *testing.T) {
+	const SCRIPT = `
+	var b = new ArrayBuffer(8);
+	$DETACHBUFFER(b);
+	assert.throws(TypeError, function() {
+		b.slice(0, 0);
+	}, "slice(0,0) on a detached buffer must throw");
+	`
+	vm := New()
+	vm.Set("$DETACHBUFFER", func(buf *ArrayBuffer) {
+		buf.Detach()
+	})
+	vm.testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayBufferSliceSameBufferSpeciesZeroLen(t *testing.T) {
+	const SCRIPT = `
+	var b = new ArrayBuffer(8);
+	var species = function() { return b; };
+	var ctor = function() {};
+	ctor[Symbol.species] = species;
+	Object.defineProperty(b, "constructor", {value: ctor});
+	assert.throws(TypeError, function() {
+		b.slice(0, 0);
+	}, "slice(0,0) with a species returning the source buffer must throw");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
 func TestTypedArrayDefineProperty(t *testing.T) {
 	const SCRIPT = `
 	var a = new Uint8Array(1);
@@ -541,4 +576,805 @@ func TestTypedArrayExport(t *testing.T) {
 		}
 	})
 
+}
+
+func TestTypedArraySetWithEmptySrc(t *testing.T) {
+	const SCRIPT = `
+	new Uint8Array(0).set(new Int8Array(0));
+	new Uint8Array(0).set(new Uint8Array(0));
+	`
+	testScript(SCRIPT, _undefined, t)
+}
+
+func TestUint8ArrayFromHex(t *testing.T) {
+	vm := New()
+
+	// valid-hex string
+	retH, err := vm.RunString(`
+	Uint8Array.fromHex("0123456789ABcdEf");
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bufStr := stdhex.EncodeToString(retH.Export().([]byte)) // means Uint8Array
+	if bufStr != "0123456789abcdef" {
+		t.Fatal(bufStr)
+	}
+
+	data := []byte{0xAA, 0xBB}
+	buf := vm.NewArrayBuffer(data)
+	vm.Set("buf", buf)
+	_, err = vm.RunString(`
+	var a = new Uint8Array(buf);
+	var b = Uint8Array.fromHex("AaBb");
+
+	if (a.length !== 2 || b.length !== 2) {
+		throw new Error(b);
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) {
+		throw new Error(b);
+		}
+	}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ret, err := vm.RunString(`
+	var b = Uint8Array.fromHex("ccDD");
+	b.buffer;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf1 := ret.Export().(ArrayBuffer)
+	data1 := buf1.Bytes()
+	if len(data1) != 2 || data1[0] != 0xCC || data1[1] != 0xDD {
+		t.Fatal(data1)
+	}
+	if buf1.Detached() {
+		t.Fatal("buf1.Detached() returned true")
+	}
+	if !buf1.Detach() {
+		t.Fatal("buf1.Detach() returned false")
+	}
+	if !buf1.Detached() {
+		t.Fatal("buf1.Detached() returned false")
+	}
+	_, err = vm.RunString(`
+	if (b[0] !== undefined) {
+		throw new Error("b[0] !== undefined");
+	}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUint8ArrayToHex(t *testing.T) {
+	const SCRIPT = `
+	var arr = Uint8Array.fromHex("0123456789ABcdEf");
+	assert.sameValue(arr.toHex(), "0123456789abcdef", "valid-hex string");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestUint8ArraySetFromHex(t *testing.T) {
+	const SCRIPT = `
+	var arr = Uint8Array.fromHex("0123456789ABcdEf");
+	arr.setFromHex("0123456789ABcdEf");
+	assert.sameValue(arr.toHex(), "0123456789abcdef", "valid-hex-string");
+
+	// offset length[Uint8Array] > length(setFromHex)
+	var arr2 = new Uint8Array(8);
+	arr2.subarray(3).setFromHex("cafed00d");
+	assert.sameValue(arr2.toHex(), "000000cafed00d00", "subarray-longer-than-input");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// Whatever was decoded before an error must still be written into the
+// destination: the spec performs SetUint8ArrayBytes before the throw.
+func TestUint8ArraySetFromHexPartialWrite(t *testing.T) {
+	const SCRIPT = `
+	var arr = new Uint8Array(4);
+	assert.throws(SyntaxError, function() {
+		arr.setFromHex("aabbZZcc");
+	}, "invalid-character-mid-string");
+	// writes "aabb" and then throws on "ZZ"
+	assert.sameValue(arr.toHex(), "aabb0000", "invalid-character-mid-string");
+
+	var arr2 = new Uint8Array(6);
+	assert.throws(SyntaxError, function() {
+		arr2.subarray(2).setFromHex("aabbZZcc");
+	}, "invalid-character-mid-string-subarray");
+	// writes "____aabb" and then throws on "ZZ"
+	assert.sameValue(arr2.toHex(), "0000aabb0000", "invalid-character-mid-string-subarray");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestUint8ArrayFromBase64(t *testing.T) {
+	testCases := []struct {
+		name     string
+		script   string
+		expected string
+	}{
+		// ---------loose---------
+		{
+			// whitespace around the padding is not covered by test262
+			name:     "loose-base64-with-whitespace",
+			script:   `Uint8Array.fromBase64(" aGVs\tb\nG8\r\n = ")`,
+			expected: "hello",
+		},
+		// ---------strict---------
+		{
+			// input is an exact multiple of 4 chars: no padding needed even in strict mode
+			name:     "strict-base64-missing-padding",
+			script:   `Uint8Array.fromBase64("aGVsbG8x", { lastChunkHandling: "strict" })`,
+			expected: "hello1",
+		},
+		{
+			name:     "strict-base64-with-whitespace",
+			script:   `Uint8Array.fromBase64(" aGVs\tb\nG8\r\nx ", { lastChunkHandling: "strict" })`,
+			expected: "hello1",
+		},
+		{
+			name:     "strict-base64-empty",
+			script:   `Uint8Array.fromBase64("", { lastChunkHandling: "strict" })`,
+			expected: "",
+		},
+		// ---------stop-before-partial---------
+		{
+			name:     "partial-base64-with-whitespace",
+			script:   `Uint8Array.fromBase64(" aGVs\tb\nG8\r\n = ", { lastChunkHandling: "stop-before-partial" })`,
+			expected: "hello",
+		},
+		{
+			name:     "partial-base64-empty",
+			script:   `Uint8Array.fromBase64("", { lastChunkHandling: "stop-before-partial" })`,
+			expected: "",
+		},
+
+		// ---------base64url----------
+		{
+			name:     "loose-base64url-with-padding",
+			script:   `Uint8Array.fromBase64("aGVsbG8-ISE_YQ==", { alphabet: "base64url"})`,
+			expected: "hello>!!?a",
+		},
+		{
+			name:     "loose-base64url-with-whitespace",
+			script:   `Uint8Array.fromBase64(" aGVs\tbG\n8-ISE_Y\r\nQ= = ", { alphabet: "base64url"})`,
+			expected: "hello>!!?a",
+		},
+		{
+			name:     "loose-base64url-empty",
+			script:   `Uint8Array.fromBase64("", { alphabet: "base64url"})`,
+			expected: "",
+		},
+		{
+			name:     "strict-base64url-missing-padding",
+			script:   `Uint8Array.fromBase64("aGVsbG8-ISE_", { lastChunkHandling: "strict", alphabet: "base64url" })`,
+			expected: "hello>!!?",
+		},
+		{
+			name:     "partial-base64url-with-padding",
+			script:   `Uint8Array.fromBase64("aGVsbG8-ISE_YQ==", { lastChunkHandling: "stop-before-partial", alphabet: "base64url" })`,
+			expected: "hello>!!?a",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedHex := stdhex.EncodeToString([]byte(tc.expected))
+			script := fmt.Sprintf(`assert.sameValue(%s.toHex(), "%s", "%s");`, tc.script, expectedHex, tc.name)
+			testScriptWithTestLib(script, _undefined, t)
+		})
+	}
+}
+
+func TestInvalidUint8ArrayFromBase64(t *testing.T) {
+	const SCRIPT = `
+	// ---------SyntaxError---------
+	assert.throws(SyntaxError, function() {
+		Uint8Array.fromBase64("AB=C");
+	}, "padding-inside-chunk");
+	assert.throws(SyntaxError, function() {
+		Uint8Array.fromBase64("AB==C");
+	}, "character-after-padding");
+	// ---------TypeError---------
+	assert.throws(TypeError, function() {
+		Uint8Array.fromBase64("aGVsbG8=", null);
+	}, "options-null");
+	assert.throws(TypeError, function() {
+		Uint8Array.fromBase64("aGVsbG8=", "loose");
+	}, "options-not-an-object");
+	assert.throws(TypeError, function() {
+		Uint8Array.fromBase64("aGVsbG8=", { alphabet: null });
+	}, "alphabet-null");
+	assert.throws(TypeError, function() {
+		Uint8Array.fromBase64("aGVsbG8=", { lastChunkHandling: null });
+	}, "last-chunk-handling-null");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestUint8ArrayToBase64(t *testing.T) {
+	const SCRIPT = `
+	// ---------base64 (default)---------
+	var actual = Uint8Array.fromBase64("aGVs").toBase64();
+	assert.sameValue(actual, "aGVs", "no-padding-needed");
+
+	var actual = Uint8Array.fromBase64("aGVsbG8gd29ybGQ=").toBase64();
+	assert.sameValue(actual, "aGVsbG8gd29ybGQ=", "one-padding-character");
+
+	var actual = Uint8Array.fromBase64("aGVsbA==").toBase64();
+	assert.sameValue(actual, "aGVsbA==", "two-padding-characters");
+
+	var actual = new Uint8Array(0).toBase64();
+	assert.sameValue(actual, "", "empty");
+
+	// only the bytes of the subarray view are encoded
+	var actual = Uint8Array.fromHex("00aabb00").subarray(1, 3).toBase64();
+	assert.sameValue(actual, "qrs=", "subarray");
+
+	// ---------alphabet---------
+	var actual = Uint8Array.fromHex("fbefbeffffff").toBase64({ alphabet: "base64" });
+	assert.sameValue(actual, "++++////", "base64-alphabet-explicit");
+
+	var actual = Uint8Array.fromHex("fbefbeffffff").toBase64({ alphabet: "base64url" });
+	assert.sameValue(actual, "----____", "base64url-alphabet");
+
+	var actual = Uint8Array.fromHex("fbef").toBase64({ alphabet: "base64url" });
+	assert.sameValue(actual, "--8=", "base64url-alphabet-with-padding");
+
+	// ---------omitPadding---------
+	var actual = Uint8Array.fromBase64("aGVsbG8=").toBase64({ omitPadding: true });
+	assert.sameValue(actual, "aGVsbG8", "omit-padding");
+
+	var actual = Uint8Array.fromBase64("aGVsbG8=").toBase64({ omitPadding: false });
+	assert.sameValue(actual, "aGVsbG8=", "omit-padding-false");
+
+	// omitPadding is coerced with ToBoolean: any truthy value omits the padding
+	var actual = Uint8Array.fromBase64("aGVsbG8=").toBase64({ omitPadding: "false" });
+	assert.sameValue(actual, "aGVsbG8", "omit-padding-truthy-string");
+
+	var actual = Uint8Array.fromHex("fbef").toBase64({ alphabet: "base64url", omitPadding: true });
+	assert.sameValue(actual, "--8", "omit-padding-base64url");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestInvalidUint8ArrayToBase64(t *testing.T) {
+	const SCRIPT = `
+	assert.throws(TypeError, function() {
+		new Uint8Array(4).toBase64(null);
+	}, "options-null");
+	assert.throws(TypeError, function() {
+		new Uint8Array(4).toBase64("base64");
+	}, "options-not-an-object");
+	assert.throws(TypeError, function() {
+		new Uint8Array(4).toBase64({ alphabet: null });
+	}, "alphabet-null");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestUint8ArraySetFromBase64(t *testing.T) {
+	const SCRIPT = `
+	var arr = new Uint8Array(4);
+	arr.setFromBase64("aGVsbA==");
+	assert.sameValue(arr.toHex(), "68656c6c", "same-length");
+
+	// only up to the target size is decoded, the rest of the input is not read
+	var arr = new Uint8Array(3);
+	arr.setFromBase64("aGVsbG8=");
+	assert.sameValue(arr.toHex(), "68656c", "array-shorter-than-input");
+
+	// the bytes beyond the decoded length keep their previous content
+	var arr = Uint8Array.fromHex("ffffffffffff");
+	arr.setFromBase64("aGVs");
+	assert.sameValue(arr.toHex(), "68656cffffff", "array-longer-than-input");
+
+	var arr = new Uint8Array(5);
+	arr.setFromBase64("aGVs");
+	assert.sameValue(arr.toHex(), "68656c0000", "fresh-array-longer-than-input");
+
+	// only the bytes of the subarray view are written
+	var arr = new Uint8Array(8);
+	arr.subarray(3).setFromBase64("aGVs");
+	assert.sameValue(arr.toHex(), "00000068656c0000", "subarray");
+
+	var arr = new Uint8Array(4);
+	arr.setFromBase64(" aGVs\tbA==\n");
+	assert.sameValue(arr.toHex(), "68656c6c", "whitespace");
+
+	// the partial last chunk "bG8" is not decoded
+	var arr = new Uint8Array(6);
+	arr.setFromBase64("aGVsbG8", { lastChunkHandling: "stop-before-partial" });
+	assert.sameValue(arr.toHex(), "68656c000000", "stop-before-partial");
+
+	// the target holds 3 bytes: only the first full chunk (4 characters) is read
+	var arr = new Uint8Array(3);
+	assert.sameValue(arr.setFromBase64("aGVsbG8x").read, 4, "read-stops-at-target-size");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// Whatever was decoded before an error must still be written into the
+// destination: the spec performs SetUint8ArrayBytes before the throw.
+func TestUint8ArraySetFromBase64PartialWrite(t *testing.T) {
+	const SCRIPT = `
+	var arr = new Uint8Array(6);
+	assert.throws(SyntaxError, function() {
+		arr.setFromBase64("aGVs#nvalid");
+	}, "invalid-character-mid-string");
+	assert.sameValue(arr.toHex(), "68656c000000", "invalid-character-mid-string");
+
+	var arr2 = new Uint8Array(8);
+	assert.throws(SyntaxError, function() {
+		arr2.subarray(2).setFromBase64("aGVs#nvalid");
+	}, "invalid-character-mid-string-subarray");
+	assert.sameValue(arr2.toHex(), "000068656c000000", "invalid-character-mid-string-subarray");
+
+	var arr3 = new Uint8Array(12);
+	assert.throws(SyntaxError, function() {
+		arr3.subarray(2).setFromBase64("aGVsBBBB#nvalidá"); // unicode
+	}, "invalid-character-mid-string-subarray");
+	assert.sameValue(arr3.toHex(), "000068656c04104100000000", "invalid-character-mid-string-subarray-unicode");
+
+	var arr4 = new Uint8Array(12);
+	assert.throws(SyntaxError, function() {
+		arr4.subarray(2).setFromBase64("aGVsBBB#nvalidá"); // unicode
+	}, "invalid-character-mid-string-subarray");
+	assert.sameValue(arr4.toHex(), "000068656c00000000000000", "invalid-character-mid-string-subarray-unicode 1");
+
+	var arr5 = new Uint8Array(12);
+	assert.throws(SyntaxError, function() {
+		arr5.subarray(2).setFromBase64("aGVsBBBĀnvalidá"); // unicode
+	}, "invalid-character-mid-string-subarray");
+	assert.sameValue(arr5.toHex(), "000068656c00000000000000", "invalid-character-mid-string-subarray-unicode 1");
+
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestInvalidUint8ArraySetFromBase64(t *testing.T) {
+	const SCRIPT = `
+	// ---------SyntaxError---------
+	// a trailing chunk of length 1 is invalid even in loose mode
+	assert.throws(SyntaxError, function() {
+		new Uint8Array(8).setFromBase64("abcde");
+	}, "single-extra-character");
+	// ---------TypeError---------
+	assert.throws(TypeError, function() {
+		new Uint8Array(8).setFromBase64("aGVs", null);
+	}, "options-null");
+	assert.throws(TypeError, function() {
+		new Uint8Array(8).setFromBase64("aGVs", { alphabet: "base16" });
+	}, "alphabet-unknown");
+	assert.throws(TypeError, function() {
+		new Uint8Array(8).setFromBase64("aGVs", { lastChunkHandling: "foo" });
+	}, "last-chunk-handling-unknown");
+	// the receiver must be a Uint8Array
+	assert.throws(TypeError, function() {
+		Uint8Array.prototype.setFromBase64.call(new Int8Array(8), "aGVs");
+	}, "receiver-not-uint8array");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+// The base64/hex methods (23.3.1 and 23.3.2) are additional properties of the
+// Uint8Array constructor and Uint8Array.prototype only:
+// they must not exist on any other TypedArray.
+func TestBase64HexWithoutUint8Array(t *testing.T) {
+	methods := []struct {
+		name   string
+		script string // %s is replaced with a TypedArray constructor name
+	}{
+		{"fromHex", `%s.fromHex("aabb")`},
+		{"setFromHex", `new %s(8).setFromHex("aabb")`},
+		{"toHex", `new %s(8).toHex()`},
+		{"fromBase64", `%s.fromBase64("aGVsbG8=")`},
+		{"setFromBase64", `new %s(8).setFromBase64("aGVsbG8=")`},
+		{"toBase64", `new %s(8).toBase64()`},
+	}
+	typedArrays := []string{
+		"Int8Array", "Uint8ClampedArray",
+		"Int16Array", "Uint16Array",
+		"Int32Array", "Uint32Array",
+		"Float32Array", "Float64Array",
+		"BigInt64Array", "BigUint64Array",
+	}
+
+	for _, m := range methods {
+		t.Run(m.name, func(t *testing.T) {
+			for _, ta := range typedArrays {
+				t.Run(ta, func(t *testing.T) {
+					script := fmt.Sprintf(`assert.throws(TypeError, function() { %s; });`, fmt.Sprintf(m.script, ta))
+					testScriptWithTestLib(script, _undefined, t)
+				})
+			}
+		})
+	}
+}
+
+// -------------- Uint8Array Base64 Benchmarks
+
+// decoded byte lengths to measure
+var uint8ArrayBenchSizes = []int{16, 1 << 10, 64 << 10, 1 << 20}
+
+func hexInput(decodedLen int) String {
+	return asciiString(strings.Repeat("a7", decodedLen))
+}
+
+func base64Input(decodedLen int) String {
+	return asciiString(stdbase64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", decodedLen))))
+}
+
+func TestTypedArrayExportEmptyViewAtBufferEnd(t *testing.T) {
+	tests := []struct {
+		ctor     string
+		elemSize int
+	}{
+		{"Uint8Array", 1},
+		{"Uint8ClampedArray", 1},
+		{"Int8Array", 1},
+		{"Uint16Array", 2},
+		{"Int16Array", 2},
+		{"Uint32Array", 4},
+		{"Int32Array", 4},
+		{"Float16Array", 2},
+		{"Float32Array", 4},
+		{"Float64Array", 8},
+		{"BigInt64Array", 8},
+		{"BigUint64Array", 8},
+	}
+	vm := New()
+	buf := vm.NewArrayBuffer(make([]byte, 64))
+	vm.Set("buf", buf)
+	end := uintptr(unsafe.Pointer(unsafe.SliceData(buf.Bytes()))) + 64
+	for _, tc := range tests {
+		t.Run(tc.ctor, func(t *testing.T) {
+			for _, src := range []string{
+				fmt.Sprintf("new %s(buf, 64, 0)", tc.ctor),
+				fmt.Sprintf("new %s(buf).subarray(%d)", tc.ctor, 64/tc.elemSize),
+			} {
+				v, err := vm.RunString(src)
+				if err != nil {
+					t.Fatal(src, err)
+				}
+				exported := reflect.ValueOf(v.Export())
+				if exported.Kind() != reflect.Slice || exported.Len() != 0 {
+					t.Fatalf("%s: unexpected export %v", src, exported)
+				}
+				if exported.Pointer() == end {
+					t.Errorf("%s: exported slice points one past the end of the buffer", src)
+				}
+			}
+		})
+	}
+}
+
+func TestTypedArrayExportLastElement(t *testing.T) {
+	tests := []struct {
+		ctor     string
+		elemSize int
+	}{
+		{"Uint8Array", 1},
+		{"Uint8ClampedArray", 1},
+		{"Int8Array", 1},
+		{"Uint16Array", 2},
+		{"Int16Array", 2},
+		{"Uint32Array", 4},
+		{"Int32Array", 4},
+		{"Float16Array", 2},
+		{"Float32Array", 4},
+		{"Float64Array", 8},
+		{"BigInt64Array", 8},
+		{"BigUint64Array", 8},
+	}
+	vm := New()
+	for _, tc := range tests {
+		t.Run(tc.ctor, func(t *testing.T) {
+			vm.Set("buf", vm.NewArrayBuffer(make([]byte, 64)))
+			v, err := vm.RunString(fmt.Sprintf("new %s(buf, buf.byteLength - %d, 1)", tc.ctor, tc.elemSize))
+			if err != nil {
+				t.Fatal(err)
+			}
+			exported := reflect.ValueOf(v.Export())
+			if exported.Len() != 1 {
+				t.Fatalf("expected a slice of length 1, got %d", exported.Len())
+			}
+		})
+	}
+}
+
+func BenchmarkUint8ArrayTo(b *testing.B) {
+	r := New()
+	encoders := []struct {
+		name string
+		f    func(FunctionCall) Value
+	}{
+		{"hex", r.uint8ArrayProto_toHex},
+		{"base64", r.uint8ArrayProto_toBase64},
+	}
+
+	for _, encoder := range encoders {
+		b.Run(encoder.name, func(b *testing.B) {
+			for _, size := range uint8ArrayBenchSizes {
+				b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+					call := FunctionCall{
+						This: r.newTypedArrayWithData(bytes.Repeat([]byte{0xa7}, size), r.getUint8Array(), r.newUint8ArrayObject, nil).val,
+					}
+					b.ReportAllocs()
+					b.SetBytes(int64(size))
+					for b.Loop() {
+						encoder.f(call)
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkUint8ArrayFrom(b *testing.B) {
+	r := New()
+	decoders := []struct {
+		name  string
+		input func(int) String
+		f     func(FunctionCall) Value
+	}{
+		{"hex", hexInput, r.uint8Array_fromHex},
+		{"base64", base64Input, r.uint8Array_fromBase64},
+	}
+	for _, decoder := range decoders {
+		b.Run(decoder.name, func(b *testing.B) {
+			for _, size := range uint8ArrayBenchSizes {
+				b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+					in := decoder.input(size)
+					call := FunctionCall{
+						Arguments: []Value{in},
+					}
+					b.ReportAllocs()
+					b.SetBytes(int64(size))
+					for b.Loop() {
+						decoder.f(call)
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkUint8ArraySetFrom(b *testing.B) {
+	r := New()
+	decoders := []struct {
+		name  string
+		input func(int) String
+		f     func(FunctionCall) Value
+	}{
+		{"hex", hexInput, r.uint8ArrayProto_setFromHex},
+		{"base64", base64Input, r.uint8ArrayProto_setFromBase64},
+	}
+
+	for _, decoder := range decoders {
+		b.Run(decoder.name, func(b *testing.B) {
+			for _, size := range uint8ArrayBenchSizes {
+				b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+					in := decoder.input(size)
+					call := FunctionCall{
+						Arguments: []Value{in},
+					}
+					// the receiver must be large enough to hold the whole input,
+					// otherwise the decoding stops at its length
+					call.This = r.newTypedArrayWithData(make([]byte, size), r.getUint8Array(), r.newUint8ArrayObject, nil).val
+					b.ReportAllocs()
+					b.SetBytes(int64(size))
+					for b.Loop() {
+						decoder.f(call)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestTypedArraySetOffsetBeforeSourceCoercion(t *testing.T) {
+	for _, source := range []string{"null", "undefined"} {
+		for _, result := range []string{"0", "-1", "throw", "primitive"} {
+			t.Run(source+"/"+result, func(t *testing.T) {
+				body := "return " + result + ";"
+				want := "TypeError"
+				switch result {
+				case "-1":
+					want = "RangeError"
+				case "throw":
+					body = "throw marker;"
+					want = "marker"
+				case "primitive":
+					body = "return {};"
+				}
+				script := `
+				let calls = 0;
+				const marker = new Error("offset");
+				const target = new Uint8Array([7, 8]);
+				const offset = {valueOf() { calls++; ` + body + ` }};
+				let caught;
+				try { target.set(` + source + `, offset); } catch (e) { caught = e; }
+				assert.sameValue(calls, 1, "coerce offset exactly once before rejecting source");
+				` + func() string {
+					if want == "marker" {
+						return `assert.sameValue(caught, marker, "preserve thrown offset value");`
+					}
+					return `assert.sameValue(caught.constructor, ` + want + `);`
+				}() + `
+				assert.sameValue(target.join(","), "7,8", "do not change target on failure");
+				`
+				testScriptWithTestLib(script, _undefined, t)
+			})
+		}
+	}
+}
+
+func TestTypedArraySetOffsetOrderControls(t *testing.T) {
+	const SCRIPT = `
+	const target = new Uint8Array([7, 8, 9]);
+	let log = [];
+	const source = {
+		get length() { log.push("length"); return 1; },
+		get 0() { log.push("element"); return 42; }
+	};
+	assert.sameValue(target.set(source, {valueOf() { log.push("offset"); return 1; }}), undefined);
+	assert.sameValue(log.join(","), "offset,length,element");
+	assert.sameValue(target.join(","), "7,42,9");
+	log = [];
+	assert.throws(RangeError, () => target.set(source, {valueOf() { log.push("offset"); return -1; }}));
+	assert.sameValue(log.join(","), "offset", "negative offset must not read source");
+	log = [];
+	assert.throws(TypeError, () => Uint8Array.prototype.set.call({}, source, {valueOf() { log.push("offset"); return 0; }}));
+	assert.sameValue(log.length, 0, "reject incompatible receiver before offset");
+	assert.sameValue(target.set("12", 0), undefined);
+	assert.sameValue(target.join(","), "1,2,9", "primitive string source still works");
+	assert.sameValue(target.set(3, 0), undefined);
+	assert.sameValue(target.join(","), "1,2,9", "primitive number is an empty source");
+	assert.throws(TypeError, () => target.set(null));
+	assert.throws(TypeError, () => target.set(undefined));
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArraySetOffsetDetachmentOrder(t *testing.T) {
+	const SCRIPT = `
+	for (const source of [null, undefined, {}]) {
+		const target = new Uint8Array([7]);
+		let calls = 0;
+		assert.throws(TypeError, () => target.set(source, {valueOf() {
+			calls++;
+			$DETACHBUFFER(target.buffer);
+			return 0;
+		}}));
+		assert.sameValue(calls, 1, "offset runs before source rejection and target revalidation");
+		assert.sameValue(target.buffer.byteLength, 0, "offset side effect occurred");
+	}
+	const detached = new Uint8Array(1);
+	$DETACHBUFFER(detached.buffer);
+	let calls = 0;
+	assert.throws(RangeError, () => detached.set(null, {valueOf() { calls++; return -1; }}));
+	assert.sameValue(calls, 1, "negative offset precedes detached target and null source");
+	let log = [];
+	assert.throws(TypeError, () => detached.set({get length() { log.push("length"); return 0; }}, 0));
+	assert.sameValue(log.length, 0, "detached target must not read source length");
+	`
+	vm := New()
+	if err := vm.Set("$DETACHBUFFER", func(buf *ArrayBuffer) { buf.Detach() }); err != nil {
+		t.Fatal(err)
+	}
+	vm.testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArraySetConvertsAfterGetterDetaches(t *testing.T) {
+	for _, ctor := range []string{"Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"} {
+		t.Run(ctor, func(t *testing.T) {
+			script := `
+			const C = ` + ctor + `;
+			const target = new C(1);
+			const marker = new Error("element conversion");
+			let log = [];
+			const source = {length: 1, get 0() {
+				log.push("get");
+				$DETACHBUFFER(target.buffer);
+				return {valueOf() { log.push("convert"); throw marker; }};
+			}};
+			let caught;
+			try { target.set(source); } catch(e) { caught = e; }
+			assert.sameValue(caught, marker, "propagate element conversion even after detachment");
+			assert.sameValue(log.join(","), "get,convert");
+			assert.sameValue(target.buffer.byteLength, 0);
+			`
+			vm := New()
+			vm.Set("$DETACHBUFFER", func(buf *ArrayBuffer) { buf.Detach() })
+			vm.testScriptWithTestLib(script, _undefined, t)
+		})
+	}
+}
+
+func TestTypedArraySetContinuesConversionsAfterDetachment(t *testing.T) {
+	for _, ctor := range []string{"Uint8Array", "Float64Array", "BigInt64Array", "BigUint64Array"} {
+		t.Run(ctor, func(t *testing.T) {
+			script := `
+			const C = ` + ctor + `;
+			const big = C === BigInt64Array || C === BigUint64Array;
+			const target = new C(2);
+			let log = [];
+			const source = {length: 2,
+				get 0() { log.push("get0"); return {valueOf() {
+					log.push("convert0"); $DETACHBUFFER(target.buffer); return big ? 1n : 1;
+				}}; },
+				get 1() { log.push("get1"); return {valueOf() {
+					log.push("convert1"); return big ? 2n : 2;
+				}}; }
+			};
+			assert.sameValue(target.set(source), undefined);
+			assert.sameValue(log.join(","), "get0,convert0,get1,convert1");
+			assert.sameValue(target.buffer.byteLength, 0);
+			`
+			vm := New()
+			vm.Set("$DETACHBUFFER", func(buf *ArrayBuffer) { buf.Detach() })
+			vm.testScriptWithTestLib(script, _undefined, t)
+		})
+	}
+}
+
+func TestTypedArraySetDetachedPrimitiveConversion(t *testing.T) {
+	for _, ctor := range []string{"Uint8Array", "Float64Array", "BigInt64Array", "BigUint64Array"} {
+		t.Run(ctor, func(t *testing.T) {
+			script := `
+			const C = ` + ctor + `;
+			const big = C === BigInt64Array || C === BigUint64Array;
+			for (const value of [Symbol("not numeric"), big ? undefined : 1n]) {
+				const target = new C(1);
+				let calls = 0;
+				const source = {length: 1, get 0() {
+					calls++; $DETACHBUFFER(target.buffer); return value;
+				}};
+				assert.throws(TypeError, () => target.set(source));
+				assert.sameValue(calls, 1);
+			}
+			// A convertible scalar must remain a successful no-op after detachment.
+			const target = new C(1);
+			assert.sameValue(target.set({length:1, get 0() {
+				$DETACHBUFFER(target.buffer); return big ? 1n : 1;
+			}}), undefined);
+			assert.sameValue(target.length, 0);
+			`
+			vm := New()
+			vm.Set("$DETACHBUFFER", func(buf *ArrayBuffer) { buf.Detach() })
+			vm.testScriptWithTestLib(script, _undefined, t)
+		})
+	}
+}
+
+func TestTypedArraySetDoesNotWriteTransferredBuffer(t *testing.T) {
+	const SCRIPT = `
+	for (const C of [Uint8Array, Float64Array, BigInt64Array, BigUint64Array]) {
+		const big = C === BigInt64Array || C === BigUint64Array;
+		const initial = big ? [7n, 8n, 9n, 10n] : [7, 8, 9, 10];
+		const original = new C(initial);
+		const target = original.subarray(1, 3);
+		let moved, calls = 0;
+		const value = {valueOf() {
+			calls++;
+			moved = target.buffer.transfer();
+			return big ? 42n : 42;
+		}};
+		assert.sameValue(target.set([value]), undefined);
+		assert.sameValue(calls, 1);
+		assert.sameValue(target.length, 0);
+		assert.sameValue(new C(moved).join(","), initial.join(","),
+			"must not write to transferred bytes after element conversion detaches the target");
+	}
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
 }
