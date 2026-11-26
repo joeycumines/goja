@@ -11,7 +11,7 @@ performance.
 
 This project was largely inspired by [otto](https://github.com/robertkrimen/otto).
 
-The minimum required Go version is 1.25.
+The minimum required Go version is 1.26.
 
 Features
 --------
@@ -32,15 +32,6 @@ surrogate pairs, for example:
 
 ```javascript
 JSON.parse(`"\\uD800"`).charCodeAt(0).toString(16) // returns "fffd" instead of "d800"
-```
-
-### Date
-Conversion from calendar date to epoch timestamp uses the standard Go library which uses `int`, rather than `float` as per
-ECMAScript specification. This means if you pass arguments that overflow int to the `Date()` constructor or  if there is
-an integer overflow, the result will be incorrect, for example:
-
-```javascript
-Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740) // returns 29256 instead of 29312
 ```
 
 FAQ
@@ -222,7 +213,9 @@ See [Runtime.ToValue()](https://pkg.go.dev/github.com/joeycumines/goja#Runtime.T
 Regular Expressions
 -------------------
 
-Goja uses the embedded Go regexp library where possible, otherwise it falls back to [regexp2](https://github.com/dlclark/regexp2).
+Goja uses [regexp2](https://github.com/dlclark/regexp2) library. There are a few known incompatibilities, but they are 
+mostly edge cases and should not affect general usage. See tc39_test.go for the list of exclusions. Any new
+incompatibilities should be reported as bugs.
 
 Exceptions
 ----------
