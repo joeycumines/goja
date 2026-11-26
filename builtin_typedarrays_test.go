@@ -2,6 +2,7 @@ package goja
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -504,11 +505,299 @@ func TestTypedArrayFilterEvilSpecies(t *testing.T) {
 	testScriptWithTestLib(SCRIPT, _undefined, t)
 }
 
+func TestTypedArrayFilterDetachedValues(t *testing.T) {
+	for _, name := range []string{"Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"} {
+		t.Run(name, func(t *testing.T) {
+			for _, mode := range []string{"all", "defined only", "undefined only", "none"} {
+				t.Run(mode, func(t *testing.T) {
+					script := fmt.Sprintf(`
+      const C = %s;
+      const big = C === BigInt64Array || C === BigUint64Array;
+      const a = new C(big ? [5n, 7n, 9n] : [5, 7, 9]);
+      let calls = 0;
+      let result, error;
+      try {
+       result = a.filter((v, i, o) => {
+        assert.sameValue(o, a);
+        assert.sameValue(i, calls++);
+        assert.sameValue(v, i === 0 ? (big ? 5n : 5) : undefined);
+        if (i === 0) a.buffer.transfer();
+        const mode = %q;
+        return mode === 'all' || (mode === 'defined only' && i === 0) || (mode === 'undefined only' && i > 0);
+       });
+      } catch (e) { error = e; }
+      assert.sameValue(calls, 3, 'callbacks finish before conversion');
+      const missing = %q === 'all' || %q === 'undefined only';
+      if (big && missing) {
+       assert(error instanceof TypeError, 'undefined must not become 0n');
+      } else {
+       if (error) throw error;
+       const defined = %q === 'all' || %q === 'defined only';
+       assert.sameValue(result.length, (defined ? 1 : 0) + (missing ? 2 : 0));
+       if (defined) assert.sameValue(result[0], big ? 5n : 5, 'capture before callback detaches');
+       if (missing) {
+        const expected = C === Float16Array || C === Float32Array || C === Float64Array ? NaN : 0;
+        assert.sameValue(result[result.length - 1], expected, 'convert undefined');
+       }
+      }
+     `, name, mode, mode, mode, mode, mode)
+					testScriptWithTestLib(script, _undefined, t)
+				})
+			}
+		})
+	}
+}
+
+func TestTypedArrayFilterDetachedSpecies(t *testing.T) {
+	const SCRIPT = `
+ const a = new Float64Array([3, 4, 5]);
+ const log = [];
+ a.constructor = {[Symbol.species]: function(n) {
+  log.push('species:' + n);
+  return new Float32Array(n);
+ }};
+ const result = a.filter((v, i) => { log.push('callback:' + i); if (i === 0) a.buffer.transfer(); return true; });
+ assert.sameValue(String(result), '3,NaN,NaN');
+ assert.sameValue(log.join(','), 'callback:0,callback:1,callback:2,species:3');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFilterDetachedBigIntConversionOrder(t *testing.T) {
+	const SCRIPT = `
+ const a = new BigInt64Array([3n, 4n, 5n]);
+ const log = [];
+ let result;
+ a.constructor = {[Symbol.species]: function(n) {
+  log.push('species:' + n);
+  result = new BigInt64Array(n);
+  return result;
+ }};
+ assert.throws(TypeError, () => a.filter((v, i) => { log.push('callback:' + i); if (i === 0) a.buffer.transfer(); return true; }));
+ assert.sameValue(log.join(','), 'callback:0,callback:1,callback:2,species:3');
+ assert.sameValue(result[0], 3n, 'write the captured first value before failing on undefined');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFilterDetachedOffsetSpecies(t *testing.T) {
+	const SCRIPT = `
+ const a = new Float64Array(new Float64Array([99, 2, 4, 6, 99]).buffer, 8, 3);
+ a.constructor = {[Symbol.species]: function(n) { return new Float64Array(new ArrayBuffer((n + 2) * 8), 8, n); }};
+ const b = a.filter((v, i) => { if (i === 0) a.buffer.transfer(); return i !== 1; });
+ assert.sameValue(b.byteOffset, 8);
+ assert.sameValue(String(b), '2,NaN');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFilterDetachedIntegerSpecies(t *testing.T) {
+	const SCRIPT = `
+ const a = new Float64Array([3, 4]);
+ a.constructor = {[Symbol.species]: Int32Array};
+ const b = a.filter((v, i) => { if (i === 0) a.buffer.transfer(); return true; });
+ assert.sameValue(String(b), '3,0');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFilterDetachedSpeciesError(t *testing.T) {
+	const SCRIPT = `
+ const a = new BigInt64Array([3n, 4n]);
+ const log = [];
+ Object.defineProperty(a, 'constructor', {get() { log.push('species'); throw 'constructor failure'; }});
+ let caught;
+ try { a.filter((v, i) => { log.push(i); if (i === 0) a.buffer.transfer(); return true; }); } catch (e) { caught = e; }
+ assert.sameValue(caught, 'constructor failure');
+ assert.sameValue(log.join(','), '0,1,species');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFilterCaptureBeforeCallback(t *testing.T) {
+	const SCRIPT = `
+ const a = new Float64Array([3, 4, 5]);
+ const b = a.filter((v, i) => { a[i] = 99; if (i === 2) a.buffer.transfer(); return true; });
+ assert.sameValue(String(b), '3,4,5');
+ `
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
 func TestToSortedSubarray(t *testing.T) {
 	const SCRIPT = `
 	var base = new Uint8Array([9,8,7,6,5,4,3,2,1,0]);
 	var view = base.subarray(3);          // = [6,5,4,3,2,1,0]
 	assert(compareArray(view.toSorted(), [0,1,2,3,4,5,6]));
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestTypedArrayFromPrimitive(t *testing.T) {
+	const SCRIPT = `
+	assert(compareArray(Uint8Array.from("123"), [1, 2, 3]), "string");
+	assert(compareArray(Uint16Array.from("abc", c => c.charCodeAt(0)), [97, 98, 99]), "string, mapFn");
+	assert.sameValue(Uint8Array.from(5).length, 0, "number");
+
+	var receiver;
+	Object.defineProperty(Number.prototype, Symbol.iterator, {
+		value: function() {
+			"use strict";
+			receiver = this;
+			return [7][Symbol.iterator]();
+		}
+	});
+	assert(compareArray(Uint8Array.from(5), [7]), "number, iterator");
+	assert.sameValue(receiver, 5, "iterator receiver");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayBufferTransfer(t *testing.T) {
+	const SCRIPT = `
+var buf = new Uint8Array([1, 2, 3, 4]).buffer;
+var ta = new Uint8Array(buf);
+var grown = buf.transfer(6);
+assert(buf.detached, "source is detached");
+assert.sameValue(buf.byteLength, 0, "source byteLength");
+assert.sameValue(ta.length, 0, "view on the source");
+assert(!grown.detached, "result is not detached");
+assert(compareArray(new Uint8Array(grown), [1, 2, 3, 4, 0, 0]), "grown contents");
+
+var shrunk = grown.transferToFixedLength(2);
+assert(compareArray(new Uint8Array(shrunk), [1, 2]), "shrunk contents");
+assert.sameValue(shrunk.transfer().byteLength, 2, "default length");
+assert.throws(TypeError, function() { shrunk.transfer(); }, "detached source");
+`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayBufferTransferFromGo(t *testing.T) {
+	vm := New()
+	data := []byte{1, 2, 3}
+	ab := vm.NewArrayBuffer(data)
+	vm.Set("ab", ab)
+	v, err := vm.RunString(`ab.transfer()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ab.Detached() || ab.Bytes() != nil {
+		t.Fatal("source ArrayBuffer is not detached")
+	}
+	b := v.Export().(ArrayBuffer).Bytes()
+	if !bytes.Equal(b, []byte{1, 2, 3}) {
+		t.Fatalf("unexpected contents: %v", b)
+	}
+	if &b[0] != &data[0] {
+		t.Fatal("the data was copied instead of being transferred")
+	}
+}
+
+func TestTypedArraySearchNegativeZero(t *testing.T) {
+	const SCRIPT = `
+	[Float32Array, Float64Array].forEach(function(TA) {
+		const name = TA.name;
+		const a = new TA([-0, 1]);
+		assert.sameValue(a.includes(0), true, name + " includes 0");
+		assert.sameValue(a.includes(-0), true, name + " includes -0");
+		assert.sameValue(a.indexOf(0), 0, name + " indexOf 0");
+		assert.sameValue(a.indexOf(-0), 0, name + " indexOf -0");
+		assert.sameValue(a.lastIndexOf(0), 0, name + " lastIndexOf 0");
+		assert.sameValue(a.lastIndexOf(-0), 0, name + " lastIndexOf -0");
+		assert.sameValue(new TA([-0, 0]).indexOf(0), 0, name + " indexOf first of -0, +0");
+		assert.sameValue(new TA([-0, 0]).lastIndexOf(-0), 1, name + " lastIndexOf last of -0, +0");
+		assert.sameValue(a.includes(2), false, name + " includes 2");
+		assert.sameValue(a.includes(0, 1), false, name + " includes 0 after fromIndex");
+		assert.sameValue(new TA([1, -0]).lastIndexOf(0, 0), -1, name + " lastIndexOf 0 before fromIndex");
+		assert.sameValue(new TA([NaN]).includes(NaN), true, name + " includes NaN");
+		assert.sameValue(new TA([NaN]).indexOf(NaN), -1, name + " indexOf NaN");
+	});
+	const i = new Int8Array([0]);
+	assert.sameValue(i.includes(-0), true, "Int8Array includes -0");
+	assert.sameValue(i.indexOf(-0), 0, "Int8Array indexOf -0");
+	assert.sameValue(i.lastIndexOf(-0), 0, "Int8Array lastIndexOf -0");
+	assert.sameValue(new BigInt64Array([0n]).includes(0n), true, "BigInt64Array includes 0n");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func testTypedArrayDetachScript(t *testing.T, name, script string) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("typed array operation accessed a detached buffer: %v", r)
+			}
+		}()
+		testScript(script, _undefined, t)
+	})
+}
+
+func TestTypedArrayDetach(t *testing.T) {
+	testTypedArrayDetachScript(t, "map", `
+		let cur = new ArrayBuffer(64);
+		const d = new Uint8Array(cur, 0, 4), z = new Uint8Array(4);
+		z.constructor = {[Symbol.species]: function(){ return d }};
+		void z.map((_, i) => { if (i === 0) cur.transfer(); return 0x41 + i });
+	`)
+
+	testTypedArrayDetachScript(t, "from array-like getter", `
+		let victim;
+		function C(n){ victim = new Uint8Array(n); return victim; }
+		const src = {length: 1, get 0(){ victim.buffer.transfer(); return 1; }};
+		void Uint8Array.from.call(C, src);
+	`)
+
+	testTypedArrayDetachScript(t, "from array-like map", `
+		let victim;
+		function C(n){ victim = new Uint8Array(n); return victim; }
+		void Uint8Array.from.call(C, {length: 1, 0: 0}, () => {
+			victim.buffer.transfer();
+			return 1;
+		});
+	`)
+
+	testTypedArrayDetachScript(t, "from iterable value conversion", `
+		let victim, transferred;
+		function C(n){ victim = new Uint8Array(n); return victim; }
+		const value = {valueOf(){ transferred = victim.buffer.transfer(); return 0x41; }};
+		void Uint8Array.from.call(C, [value]);
+		if (new Uint8Array(transferred)[0] !== 0) {
+			throw new Error("detached view wrote into the transferred buffer");
+		}
+	`)
+
+	testTypedArrayDetachScript(t, "of value conversion", `
+		let victim, transferred;
+		function C(n){ victim = new Uint8Array(n); return victim; }
+		const value = {valueOf(){ transferred = victim.buffer.transfer(); return 0x41; }};
+		void Uint8Array.of.call(C, value);
+		if (new Uint8Array(transferred)[0] !== 0) {
+			throw new Error("detached view wrote into the transferred buffer");
+		}
+	`)
+}
+
+func TestTypedArrayMixBigInt(t *testing.T) {
+	const SCRIPT = `
+	// The element type must be determined from the actual typed array, not
+	// from the configurable constructor "name" property.
+	Object.defineProperty(Uint16Array, "name", {configurable: true, get(){
+		throw new Error("name getter called");
+	}});
+	Object.defineProperty(BigUint64Array, "name", {configurable: true, get(){
+		throw new Error("name getter called");
+	}});
+
+	assert.throws(TypeError, function() { new Uint8Array(new BigInt64Array(1)); }, "BigInt source, Number target");
+	assert.throws(TypeError, function() { new BigInt64Array(new Uint8Array(1)); }, "Number source, BigInt target");
+	assert.throws(TypeError, function() { new Uint8Array(1).set(new BigInt64Array(1)); }, "BigInt source, Number target (set)");
+	assert.throws(TypeError, function() { new BigInt64Array(1).set(new Uint8Array(1)); }, "Number source, BigInt target (set)");
+
+	assert.sameValue(new Uint8Array(new Uint16Array([1, 2]))[0], 1, "Number source, Number target");
+	assert.sameValue(new BigInt64Array(new BigUint64Array([1n]))[0], 1n, "BigInt source, BigInt target");
+
+	class MyBig extends BigInt64Array {}
+	assert.sameValue(new MyBig(new BigUint64Array([1n]))[0], 1n, "BigInt source, BigInt subclass target");
 	`
 	testScriptWithTestLib(SCRIPT, _undefined, t)
 }

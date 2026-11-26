@@ -170,6 +170,34 @@ func TestArrayFrom(t *testing.T) {
 	testScriptWithTestLib(SCRIPT, _undefined, t)
 }
 
+func TestArrayFromArrayLikeMaxLength(t *testing.T) {
+	const SCRIPT = `
+		class TestError extends Error {
+		}
+
+		var src = {
+			length: 2**32,
+			get 0() {
+				throw new TestError("element read");
+			},
+		};
+		assert.throws(RangeError, () => {
+			Array.from(src);
+		});
+		assert.throws(RangeError, () => {
+			Array.from(src, (v) => v);
+		});
+		assert.throws(RangeError, () => {
+			Array.from.call({}, src);
+		});
+		src.length = 2**32 - 1;
+		assert.throws(TestError, () => {
+			Array.from(src);
+		});
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
 func TestArrayOf(t *testing.T) {
 	const SCRIPT = `
 	function T1() {
@@ -262,6 +290,15 @@ func TestArraySortNonStdArray(t *testing.T) {
 
 	assert.sameValue(array[2], undefined);
 	assert.sameValue(array.length, 4);
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayLikeSortMaxLength(t *testing.T) {
+	const SCRIPT = `
+		assert.throws(RangeError, () => {
+			Array.prototype.sort.call({length: 2**53-1});
+		});
 	`
 	testScriptWithTestLib(SCRIPT, _undefined, t)
 }
@@ -364,4 +401,160 @@ func TestArrayToSpliced(t *testing.T) {
 	assert(compareArray(a, [1, 2, 3, 4, 5]));
 	`
 	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayIncludesNegativeZero(t *testing.T) {
+	const SCRIPT = `
+	assert.sameValue([-0].includes(0), true, "-0 element, +0 searched");
+	assert.sameValue([-0].includes(-0), true, "-0 element, -0 searched");
+	assert.sameValue([-0].includes(1), false, "-0 element, 1 searched");
+	assert.sameValue([NaN].includes(NaN), true, "NaN");
+	assert.sameValue(Array.prototype.includes.call({length: 1, 0: -0}, 0), true, "array-like");
+	assert.sameValue(Array.prototype.includes.call({length: 1, 0: -0}, 1), false, "array-like, 1 searched");
+	var z = -0;
+	assert.sameValue([-z].includes(0), true, "+0 from negating -0");
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestStdArrayWithNilProto(t *testing.T) {
+	const SCRIPT = `
+	const a = [1, 2, 3];
+	Object.setPrototypeOf(a, null);
+	Array.prototype.shift.call(a); // should not panic
+	a.length;
+	`
+	testScript(SCRIPT, intToValue(2), t)
+}
+
+func TestArrayFindIndexWithHoles(t *testing.T) {
+	const SCRIPT = `
+	[,].findIndex(String);
+	`
+	testScript(SCRIPT, intToValue(0), t)
+}
+
+func TestArrayFromWithHoles(t *testing.T) {
+	const SCRIPT = `
+	assert(compareArray(Array.from({ length: 1 }, String), ["undefined"]));
+	`
+	testScriptWithTestLib(SCRIPT, _undefined, t)
+}
+
+func TestArrayCircularReferenceToString(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	var str = String(T);
+	// Circular reference should be replaced with empty string
+	str === "1,2,3,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,";
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceNumericOperation(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	try {
+		var x = T % 2;  // This should not crash
+		true;
+	} catch (e) {
+		false;
+	}
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceJoin(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	var str = T.join(',');
+	// Circular reference should be replaced with empty string
+	str === "1,2,3,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,";
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceConcat(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	var str = '' + T;  // String concatenation
+	// Circular reference should be replaced with empty string
+	str === "1,2,3,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,";
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceToLocaleString(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	var str = T.toLocaleString();
+	// Circular reference should be replaced with empty string
+	str === "1,2,3,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,";
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayMultipleCircularReferences(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;
+	T[76] = T;
+	T[80] = T;
+	var str = String(T);
+	// Should handle multiple circular references - all should be empty strings
+	str.split(',').length === 81;
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayNestedCircularReference(t *testing.T) {
+	const SCRIPT = `
+	var A = [1, 2];
+	var B = [3, 4];
+	A[2] = B;
+	B[2] = A;  // Mutual circular reference
+	var str = String(A);
+	// A contains B which contains A - circular refs should be empty
+	str === "1,2,3,4,";
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceAccessOK(t *testing.T) {
+	const SCRIPT = `
+	// These operations should still work fine
+	var T = [1, 2, 3];
+	T[42] = T;
+	
+	// Accessing circular reference is OK
+	var same = T[42] === T;
+	
+	// Accessing elements through circular reference is OK
+	var first = T[42][0];
+	
+	// Deep nesting is OK
+	var deep = T[42][42][42][42][42][0];
+	
+	same && first === 1 && deep === 1;
+	`
+	testScript(SCRIPT, valueTrue, t)
+}
+
+func TestArrayCircularReferenceComparison(t *testing.T) {
+	const SCRIPT = `
+	var T = [1, 2, 3];
+	T[42] = T;  // Create circular reference
+	try {
+		var result = T == 5;  // Comparison should not crash
+		true;
+	} catch (e) {
+		false;
+	}
+	`
+	testScript(SCRIPT, valueTrue, t)
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/ast"
 	"hash/maphash"
+	"iter"
 	"math"
 	"math/big"
 	"math/bits"
@@ -77,6 +78,7 @@ type global struct {
 	Int16Array        *Object
 	Uint32Array       *Object
 	Int32Array        *Object
+	Float16Array      *Object
 	Float32Array      *Object
 	Float64Array      *Object
 	BigInt64Array     *Object
@@ -124,7 +126,10 @@ type global struct {
 
 	AsyncFunctionPrototype *Object
 
+	Iterator                      *Object
 	IteratorPrototype             *Object
+	IteratorHelperPrototype       *Object
+	WrapForValidIteratorPrototype *Object
 	ArrayIteratorPrototype        *Object
 	MapIteratorPrototype          *Object
 	SetIteratorPrototype          *Object
@@ -143,11 +148,14 @@ type global struct {
 	weakMapAdder  *Object
 	mapAdder      *Object
 	setAdder      *Object
+	setHas        *Object
 	arrayValues   *Object
 	arrayToString *Object
 
 	stringproto_trimEnd   *Object
 	stringproto_trimStart *Object
+
+	dateproto_toUTCString *Object
 
 	parseFloat, parseInt *Object
 
@@ -185,6 +193,7 @@ type Runtime struct {
 	now             Now
 	_collator       *collate.Collator
 	parserOptions   []parser.Option
+	regexpTimeLimit time.Duration
 
 	symbolRegistry map[unistring.String]*Symbol
 
@@ -202,9 +211,12 @@ type Runtime struct {
 	asyncContextTracker     AsyncContextTracker
 	promiseJobEnqueuer      PromiseJobEnqueuer
 	leavingAbrupt           bool
-	// abruptLeaves counts completed outermost abrupt cleanups. leave() uses it
-	// to notice a nested cleanup that finished while a hook was running.
-	abruptLeaves uint32
+	// nativeCallDepth keeps queue ownership across Go-only callbacks, which
+	// need not have interpreted call frames. It does not consume VM stack depth.
+	nativeCallDepth uint32
+	// Suspended Go iterators own pull coroutines that need native-only cleanup
+	// after terminal abort, including while an async generator is awaiting.
+	nativeIterators map[*goIteratorState]struct{}
 	// asyncTrackerActive is true while a reaction job's tracker is between
 	// Resumed and Exited. enqueuePromiseJob buffers jobs instead of delivering
 	// them to a synchronous hook during this window.
@@ -447,6 +459,7 @@ func (r *Runtime) createIterProto(val *Object) objectImpl {
 	o := newBaseObjectObj(val, r.global.ObjectPrototype, classObject)
 
 	o._putSym(SymIterator, valueProp(r.newNativeFunc(r.returnThis, "[Symbol.iterator]", 0), true, false, true))
+	r.addIteratorHelpers(o)
 	return o
 }
 
@@ -498,7 +511,7 @@ func (r *Runtime) newReferenceError(name unistring.String) Value {
 	return r.newErrorf(r.getReferenceError(), "%s is not defined", name)
 }
 
-func (r *Runtime) newSyntaxError(msg string, offset int) Value {
+func (r *Runtime) newSyntaxError(msg string) Value {
 	return r.builtin_new(r.getSyntaxError(), []Value{newStringValue(msg)})
 }
 
@@ -776,6 +789,28 @@ func (r *Runtime) newNativeFunc(call func(FunctionCall) Value, name unistring.St
 	return v
 }
 
+func (r *Runtime) newIteratorNextFunc(call func(FunctionCall) Value, length int64, getNextResult func(*Object) func(Value) (Value, bool)) *Object {
+	v := &Object{runtime: r}
+
+	f := &iteratorNextFunction{
+		nativeFuncObject: nativeFuncObject{
+			baseFuncObject: baseFuncObject{
+				baseObject: baseObject{
+					class:      classFunction,
+					val:        v,
+					extensible: true,
+					prototype:  r.getFunctionPrototype(),
+				},
+			},
+			f: call,
+		},
+		getNextResult: getNextResult,
+	}
+	v.self = f
+	f.init("next", intToValue(length))
+	return v
+}
+
 func (r *Runtime) newWrappedFunc(value reflect.Value) *Object {
 
 	v := &Object{runtime: r}
@@ -797,6 +832,9 @@ func (r *Runtime) newWrappedFunc(value reflect.Value) *Object {
 	v.self = f
 	name := unistring.NewFromString(runtime.FuncForPC(value.Pointer()).Name())
 	f.init(name, intToValue(int64(value.Type().NumIn())))
+	if iter := r.getGoFuncIterator(value); iter != nil {
+		f._putSym(SymIterator, valueProp(r.newNativeFunc(iter, "[Symbol.iterator]", 0), true, false, true))
+	}
 	return v
 }
 
@@ -861,11 +899,11 @@ func (r *Runtime) builtin_Number(call FunctionCall) Value {
 		case *Object:
 			primValue := t.toPrimitiveNumber()
 			if bigint, ok := primValue.(*valueBigInt); ok {
-				return intToValue((*big.Int)(bigint).Int64())
+				return bigint.numberValue()
 			}
 			return primValue.ToNumber()
 		case *valueBigInt:
-			return intToValue((*big.Int)(t).Int64())
+			return t.numberValue()
 		default:
 			return t.ToNumber()
 		}
@@ -881,12 +919,12 @@ func (r *Runtime) builtin_newNumber(args []Value, proto *Object) *Object {
 		case *Object:
 			primValue := t.toPrimitiveNumber()
 			if bigint, ok := primValue.(*valueBigInt); ok {
-				v = intToValue((*big.Int)(bigint).Int64())
+				v = bigint.numberValue()
 			} else {
 				v = primValue.ToNumber()
 			}
 		case *valueBigInt:
-			v = intToValue((*big.Int)(t).Int64())
+			v = t.numberValue()
 		default:
 			v = t.ToNumber()
 		}
@@ -1111,6 +1149,27 @@ func toInt16(v Value) int16 {
 	return 0
 }
 
+// floatToUint32 implements ECMAScript ToUint32 for float64 values.
+func floatToUint32(f float64) uint32 {
+	b := math.Float64bits(f)
+	exp := int(b>>52&0x7ff) - 1075 // value = mant * 2^exp
+	mant := b&(1<<52-1) | 1<<52
+
+	var r uint64
+	switch {
+	case exp >= 32: // multiple of 2^32; also Inf/NaN (exp = 972)
+		r = 0
+	case exp >= 0:
+		r = mant << uint(exp) // high bits wrap away, low 32 are exact
+	default:
+		r = mant >> uint(-exp) // truncates toward zero; Go gives 0 for shifts >= 64
+	}
+	if int64(b) < 0 {
+		r = -r
+	}
+	return uint32(r)
+}
+
 func toUint16(v Value) uint16 {
 	v = v.ToNumber()
 	if i, ok := v.(valueInt); ok {
@@ -1118,10 +1177,7 @@ func toUint16(v Value) uint16 {
 	}
 
 	if f, ok := v.(valueFloat); ok {
-		f := float64(f)
-		if !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return uint16(int64(f))
-		}
+		return uint16(floatToUint32(float64(f)))
 	}
 	return 0
 }
@@ -1133,10 +1189,7 @@ func toInt32(v Value) int32 {
 	}
 
 	if f, ok := v.(valueFloat); ok {
-		f := float64(f)
-		if !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return int32(int64(f))
-		}
+		return int32(floatToUint32(float64(f)))
 	}
 	return 0
 }
@@ -1148,10 +1201,7 @@ func toUint32(v Value) uint32 {
 	}
 
 	if f, ok := v.(valueFloat); ok {
-		f := float64(f)
-		if !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return uint32(int64(f))
-		}
+		return floatToUint32(float64(f))
 	}
 	return 0
 }
@@ -1214,6 +1264,10 @@ func toUint(v Value) uint {
 		}
 	}
 	return 0
+}
+
+func toFloat16Bits(v Value) uint16 {
+	return Float64ToFloat16(v.ToFloat())
 }
 
 func toFloat32(v Value) float32 {
@@ -1280,6 +1334,22 @@ func toIntStrict(i int64) int {
 		}
 	}
 	return int(i)
+}
+
+func safeMul(left, right int) int {
+	res := left * right
+	// check for overflow
+	if left == 0 || right == 0 || res/left == right {
+		return res
+	}
+	panic(rangeError("Integer overflow"))
+}
+
+func toStringLen(n int) int {
+	if n < 0 {
+		panic(rangeError("Invalid string length"))
+	}
+	return n
 }
 
 func toIntClamp(i int64) int {
@@ -1358,12 +1428,16 @@ func MustCompile(name, src string, strict bool) *Program {
 func Parse(name, src string, options ...parser.Option) (prg *js_ast.Program, err error) {
 	prg, err1 := parser.ParseFile(nil, name, src, 0, options...)
 	if err1 != nil {
-		// FIXME offset
-		err = &CompilerSyntaxError{
-			CompilerError: CompilerError{
-				Message: err1.Error(),
-			},
+		e := &CompilerSyntaxError{}
+		var list parser.ErrorList
+		if errors.As(err1, &list) && len(list) > 0 {
+			e.Message = list[0].Message
+			e.File = list[0].File
+			e.Offset = list[0].Offset
+		} else {
+			e.Message = err1.Error()
 		}
+		err = e
 	}
 	return
 }
@@ -1430,23 +1504,51 @@ func (r *Runtime) RunScript(name, src string) (Value, error) {
 	return r.RunProgram(p)
 }
 
+// A thrown JavaScript Exception stays catchable even when it carries a native
+// interruption as its Go cause. Inspect only structural native error wrappers;
+// calling an arbitrary As method here would change VM control-flow semantics.
 func isUncatchableException(e error) bool {
-	for ; e != nil; e = errors.Unwrap(e) {
-		if _, ok := e.(uncatchableException); ok {
+	switch e.(type) {
+	case nil, *Exception:
+		return false
+	case uncatchableException:
+		return true
+	}
+	pending := []error{e}
+	var seen map[error]struct{}
+	for len(pending) > 0 {
+		n := len(pending) - 1
+		e = pending[n]
+		pending = pending[:n]
+		// User error graphs can contain shared subtrees or pointer cycles.
+		// Value.Comparable checks interface-containing structs as well as
+		// their static types, so map lookup cannot introduce a panic.
+		if e != nil && reflect.ValueOf(e).Comparable() {
+			if _, exists := seen[e]; exists {
+				continue
+			}
+			if seen == nil {
+				seen = make(map[error]struct{})
+			}
+			seen[e] = struct{}{}
+		}
+		switch v := e.(type) {
+		case nil, *Exception:
+			continue
+		case uncatchableException:
 			return true
+		case interface{ Unwrap() []error }:
+			pending = append(pending, v.Unwrap()...)
+		case interface{ Unwrap() error }:
+			pending = append(pending, v.Unwrap())
 		}
 	}
 	return false
 }
 
 func asUncatchableException(v interface{}) error {
-	switch v := v.(type) {
-	case uncatchableException:
-		return v
-	case error:
-		if isUncatchableException(v) {
-			return v
-		}
+	if e, ok := v.(error); ok && isUncatchableException(e) {
+		return e
 	}
 	return nil
 }
@@ -1456,20 +1558,26 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	vm := r.vm
 	frame := vm.saveExecutionFrame()
 	recursive := frame.callStackLen > 0
+	ownsQueue := !recursive && r.nativeCallDepth == 0
+	r.nativeCallDepth++
+	defer func() { r.nativeCallDepth-- }()
 	defer func() {
 		x := recover()
 		// This also covers a failed pushCtx and direct JavaScript entry
 		// from a forwarding hook after runTry has already returned.
 		vm.restoreExecutionFrame(frame)
+		if ownsQueue && len(r.nativeIterators) != 0 && vm.isAborted() {
+			r.leaveAbrupt()
+		}
 		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if !recursive {
+				if ownsQueue {
 					r.leaveAbrupt()
 				}
 			} else {
-				if !recursive {
-					// Catchable panics do not consume an interrupt the native
+				if ownsQueue {
+					// Native panics do not consume an interrupt the native
 					// code may have requested just before panicking.
 					r.leaveAbruptInternal(true)
 				}
@@ -1506,7 +1614,9 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	} else {
 		vm.prg = nil
 		vm.sb = -1
-		r.leave()
+		if ownsQueue {
+			r.leave()
+		}
 	}
 	return
 }
@@ -1560,6 +1670,9 @@ func (r *Runtime) Interrupt(v interface{}) {
 // still be forwarded to a configured PromiseJobEnqueuer, so a host must also
 // stop admitting callbacks and release its native work. Abort does not manage
 // an event loop, join goroutines, or cancel host-owned contexts.
+// Suspended Go iterator resources are stopped at the next runtime-owner
+// boundary, not on the goroutine that calls Abort. Abandoned sources remain
+// retained until exhaustion, return, or cleanup.
 func (r *Runtime) Abort(v interface{}) {
 	r.vm.Abort(v)
 }
@@ -1690,7 +1803,17 @@ invalid characters).
 
 # Nil
 
-Nil is converted to null.
+Nil is converted to null. This includes nil pointers, nil interfaces, nil slices, and nil functions. Note that they lose
+their type as a result and exported as plain nil interface (nil type and nil value).
+
+# Pointers
+
+Pointers are de-referenced and the referenced object dictates the shape of the Value. The Value keeps referring to the
+same object, so any changes made to it will be reflected. If the referenced value is a nil map without methods, setting
+a property creates a map. Same applies to slices.
+
+Note, the indirection only goes one level, i.e. a pointer to a pointer becomes a generic empty Object. As with any
+Object wrapper it can have Symbol properties, but no string or index properties. It exports to the original pointer value.
 
 # Functions
 
@@ -1746,6 +1869,13 @@ Functions with multiple return values return an Array. If the last return value 
 converted into a JS exception. If the error is *Exception, it is thrown as is, otherwise it's wrapped in a GoEerror.
 Note that if there are exactly two return values and the last is an `error`, the function returns the first value as is,
 not an Array.
+
+Iterator functions (https://pkg.go.dev/iter) have Symbol.iterator property and therefore can be iterated over using
+for-of loops. Both single-value and 2-value iterators are supported. In case of 2-value iterators the yielded value
+is a 2-element array, unless the second value's type is `error`. If the second value is error, and the iterator yields
+a non-nil value for it, it is thrown as an exception (and iteration stops), otherwise a single value is yielded.
+
+See ExampleRuntime_ToValue_seq, ExampleRuntime_ToValue_seq2 and ExampleRuntime_ToValue_seq2err.
 
 # Structs
 
@@ -1952,7 +2082,7 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 	}
 
 	value := origValue
-	for value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		value = value.Elem()
 	}
 
@@ -1962,6 +2092,9 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 
 	switch value.Kind() {
 	case reflect.Map:
+		if value.IsNil() && !value.CanSet() {
+			return _null
+		}
 		if value.Type().NumMethod() == 0 {
 			switch value.Type().Key().Kind() {
 			case reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -1999,6 +2132,9 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 		obj.self = a
 		return obj
 	case reflect.Slice:
+		if value.IsNil() && !value.CanSet() {
+			return _null
+		}
 		obj := &Object{runtime: r}
 		a := &objectGoSliceReflect{
 			objectGoArrayReflect: objectGoArrayReflect{
@@ -2015,6 +2151,9 @@ func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 		obj.self = a
 		return obj
 	case reflect.Func:
+		if value.IsNil() {
+			return _null
+		}
 		return r.newWrappedFunc(value)
 	}
 
@@ -2335,11 +2474,22 @@ func (r *Runtime) wrapJSFunc(fn Callable, typ reflect.Type) func(args []reflect.
 		if err != nil {
 			if numOut > 0 && typ.Out(numOut-1) == reflectTypeError {
 				if ex, ok := err.(*Exception); ok {
-					if exo, ok := ex.val.(*Object); ok {
-						if v := exo.self.getStr("value", nil); v != nil {
-							if v.ExportType().AssignableTo(reflectTypeError) {
-								err = v.Export().(error)
+					if exo, ok := ex.val.(*Object); ok && exo != nil {
+						if native, ok := exo.self.(*errorObject); ok && native.nativeError != nil {
+							// Identity belongs to the native wrapper, not its mutable
+							// JavaScript value property or prototype.
+							err = native.nativeError
+						} else if conversionErr := r.runWrapped(func() {
+							// Preserve the legacy conversion for arbitrary thrown
+							// objects, but protect getters and Export from leaving
+							// abandoned interpreter frames after a failure.
+							if v := exo.self.getStr("value", nil); v != nil {
+								if typ := v.ExportType(); typ != nil && typ.AssignableTo(reflectTypeError) {
+									err = v.Export().(error)
+								}
 							}
+						}); conversionErr != nil {
+							err = conversionErr
 						}
 					}
 				}
@@ -2379,7 +2529,9 @@ func (r *Runtime) wrapJSFunc(fn Callable, typ reflect.Type) func(args []reflect.
 // The arguments are converted into ES values using Runtime.ToValue(). If the func has no return values,
 // the return value is ignored. If the func has exactly one return value, it is converted to the appropriate
 // type using ExportTo(). If the last return value is 'error', exceptions are caught and returned as *Exception
-// (instances of GoError are unwrapped, i.e. their 'value' is returned instead). In all other cases exceptions
+// (values created by NewGoError return their original Go error, even after property
+// mutation; other thrown objects retain the legacy Go-error 'value' conversion).
+// In all other cases exceptions
 // result in a panic. Any extra return values are zeroed.
 //
 // 'this' value will always be set to 'undefined'.
@@ -2468,7 +2620,7 @@ func (r *Runtime) Set(name string, value interface{}) error {
 // This method will panic with an *Exception if a JavaScript exception is thrown in the process. Use Runtime.Try to catch these.
 func (r *Runtime) Get(name string) Value {
 	n := unistring.NewFromString(name)
-	if v, exists := r.global.stash.getByName(n); exists {
+	if v, exists := r.global.stash.getByName(n, false); exists {
 		return v
 	} else {
 		return r.globalObject.self.getStr(n, nil)
@@ -2484,6 +2636,27 @@ func (r *Runtime) SetRandSource(source RandSource) {
 // If not called, the default time.Now() is used.
 func (r *Runtime) SetTimeSource(now Now) {
 	r.now = now
+}
+
+// SetRegexpTimeLimit sets an approximate time limit for each regular-expression
+// search. Zero (the default) disables the limit. Negative values and values over
+// 24 hours panic. The upper bound avoids overflow in the matcher's coarse clock.
+//
+// Exceeding the limit throws a catchable JavaScript RangeError. A pending
+// Interrupt or Abort takes precedence when matching returns. The limit applies
+// separately to each search for the next match, not to a complete global match,
+// replacement, script, compilation, or input conversion. Timeout checks use the
+// regexp2 clock (normally 100 ms granularity), so this is not a hard deadline or
+// a guarantee that native work responds immediately to cancellation.
+//
+// The policy also affects existing RegExp objects. It is local to this Runtime;
+// compiled Programs shared with other runtimes retain independent policies.
+// Call this method only on the runtime owner or while the Runtime is idle.
+func (r *Runtime) SetRegexpTimeLimit(limit time.Duration) {
+	if limit < 0 || limit > 24*time.Hour {
+		panic("goja: regexp time limit must be between zero and 24 hours")
+	}
+	r.regexpTimeLimit = limit
 }
 
 // SetParserOptions sets parser options to be used by RunString, RunScript and eval() within the code.
@@ -2520,7 +2693,7 @@ func AssertFunction(v Value) (Callable, bool) {
 			return func(this Value, args ...Value) (ret Value, err error) {
 				err = obj.runtime.runWrapped(func() {
 					ret = f(FunctionCall{
-						This:      this,
+						This:      nilSafe(this),
 						Arguments: args,
 					})
 				})
@@ -2554,18 +2727,24 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 	vm := r.vm
 	frame := vm.saveExecutionFrame()
 	recursive := frame.callStackLen > 0
+	ownsQueue := !recursive && r.nativeCallDepth == 0
+	r.nativeCallDepth++
+	defer func() { r.nativeCallDepth-- }()
 	defer func() {
 		x := recover()
 		vm.restoreExecutionFrame(frame)
+		if ownsQueue && len(r.nativeIterators) != 0 && vm.isAborted() {
+			r.leaveAbrupt()
+		}
 		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if !recursive {
+				if ownsQueue {
 					r.leaveAbrupt()
 				}
 			} else {
-				if !recursive {
-					// Catchable panics do not consume an interrupt the native
+				if ownsQueue {
+					// Native panics do not consume an interrupt the native
 					// code may have requested just before panicking.
 					r.leaveAbruptInternal(true)
 				}
@@ -2577,7 +2756,7 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 	if ex != nil {
 		err = ex
 	}
-	if !recursive {
+	if ownsQueue {
 		r.leave()
 	} else {
 		r.vm.clearStack()
@@ -2585,17 +2764,25 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 	return
 }
 
+// ErrPromiseJobReentry means that an explicitly submitted job would nest an
+// active async-context tracker. The job has not run; its host retains it and
+// can retry after the current reaction completes.
+var ErrPromiseJobReentry = errors.New("goja: promise job cannot reenter an active async context")
+
 // RunPromiseJob runs a promise job captured through a PromiseJobEnqueuer hook.
 // Uncatchable exceptions (InterruptedError, StackOverflowError) are recovered
 // and returned; other panics are re-thrown. Not goroutine-safe.
 //
-// The job must be run on the same Runtime that produced it.
+// The job must be run on the same Runtime that produced it. During an active
+// async context, ErrPromiseJobReentry is returned without consuming the job.
+// Interruption takes precedence over this reentry error.
 //
 // On success, if the hook is set, any jobs the job enqueued internally are
 // forwarded to the hook. If the hook is nil, they remain in r.jobQueue and run
 // on the next Run*() call. On an uncatchable error or a native panic, pending
-// jobs are forwarded to the hook without being executed, the internal queue
-// is cleared, and the ordinary interrupt flag is reset. The original error
+// jobs are forwarded to the hook without being executed and the internal queue
+// is cleared. Uncatchable exits reset the ordinary interrupt flag; other
+// native panics preserve it. Abort is never cleared. The original error
 // or panic takes precedence over a panic from the hook during this cleanup.
 //
 // When called reentrantly (from within a running script) the outer operand
@@ -2606,6 +2793,9 @@ func (r *Runtime) RunPromiseJob(job func()) (err error) {
 	vm := r.vm
 	frame := vm.saveExecutionFrame()
 	recursive := frame.callStackLen > 0
+	ownsQueue := !recursive && r.nativeCallDepth == 0
+	r.nativeCallDepth++
+	defer func() { r.nativeCallDepth-- }()
 	if !recursive {
 		// Sentinel so nested RunProgram calls (e.g. a native handler
 		// calling r.RunString) are treated as recursive and do not
@@ -2619,15 +2809,18 @@ func (r *Runtime) RunPromiseJob(job func()) (err error) {
 	defer func() {
 		x := recover()
 		vm.restoreExecutionFrame(frame)
+		if ownsQueue && len(r.nativeIterators) != 0 && vm.isAborted() {
+			r.leaveAbrupt()
+		}
 		if x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if !recursive {
+				if ownsQueue {
 					r.leaveAbrupt()
 				}
 			} else {
-				if !recursive {
-					// Catchable panics do not consume an interrupt the native
+				if ownsQueue {
+					// Native panics do not consume an interrupt the native
 					// code may have requested just before panicking.
 					r.leaveAbruptInternal(true)
 				}
@@ -2636,8 +2829,11 @@ func (r *Runtime) RunPromiseJob(job func()) (err error) {
 		}
 	}()
 	r.vm.checkInterrupt()
+	if r.asyncTrackerActive {
+		return ErrPromiseJobReentry
+	}
 	job()
-	if !recursive {
+	if ownsQueue {
 		r.vm.prg = nil
 		r.vm.sb = -1
 		r.vm.stack = nil
@@ -2833,32 +3029,304 @@ func (r *Runtime) getV(v Value, p Value) Value {
 type iteratorRecord struct {
 	iterator *Object
 	next     func(FunctionCall) Value
+	nextRes  func(Value) (Value, bool)
+	// nativeStop releases known Go iterator resources without evaluating a
+	// JavaScript return property or calling a JavaScript function.
+	nativeStop func()
+}
+
+func (ir *iteratorRecord) closeNative() {
+	if stop := ir.nativeStop; stop != nil {
+		ir.nativeStop = nil
+		stop()
+	}
+}
+
+func (r *Runtime) runNativeIteratorCleanup(stop func()) {
+	frame := r.vm.saveExecutionFrame()
+	defer func() {
+		_ = recover()
+		// Native cleanup may use direct Value APIs, which need a frame
+		// boundary even when the callback fails with a native panic.
+		r.vm.restoreExecutionFrame(frame)
+	}()
+	_ = r.vm.try(stop)
+}
+
+// The native resource state is allocated separately from the JavaScript object.
+// The cleanup registry must not keep arbitrary JS properties on an otherwise
+// unreachable iterator alive while retaining its source and stop function.
+type goIteratorObject struct {
+	baseObject
+	*goIteratorState
+}
+
+// goIteratorState owns a pulled Go iterator, which can remain suspended outside
+// the VM's iterator stack (for example across an await). Its source and stop
+// function remain registered until exhaustion, close, or terminal abort.
+type goIteratorState struct {
+	runtime     *Runtime
+	next        func(Value) (Value, bool)
+	stop        func()
+	inNext      bool
+	stopPending bool
+	done        bool
+}
+
+func (i *goIteratorState) stopNow() {
+	i.stopPending = false
+	stop := i.stop
+	i.stop = nil
+	if stop != nil {
+		stop()
+	}
+}
+
+func (i *goIteratorState) close() {
+	i.done = true
+	i.next = nil
+	delete(i.runtime.nativeIterators, i)
+	if i.inNext {
+		// iter.Pull's stop must not run while its source is running: it would
+		// try to resume the same coroutine. Finish stopping after next returns.
+		i.stopPending = true
+		return
+	}
+	i.stopNow()
+}
+
+func (i *goIteratorState) closeOnAbrupt() {
+	i.runtime.runNativeIteratorCleanup(i.close)
+}
+
+func (i *goIteratorState) nextResult(v Value) (value Value, valid bool) {
+	if i.done {
+		return _undefined, false
+	}
+	if i.inNext {
+		panic(i.runtime.NewTypeError("Go iterator is already running"))
+	}
+	i.inNext = true
+	defer func() {
+		i.inNext = false
+		if x := recover(); x != nil {
+			// Closing must not replace the exception or panic from next.
+			i.closeOnAbrupt()
+			panic(x)
+		}
+		if i.stopPending {
+			if i.runtime.vm.isAborted() {
+				i.closeOnAbrupt()
+			} else {
+				i.stopNow()
+			}
+		}
+	}()
+	value, valid = i.next(v)
+	if !valid {
+		i.close()
+	}
+	return
+}
+
+// closeNativeIterators is called by the owner while unwinding an aborted
+// runtime. It never calls a JavaScript iterator return method. Stop callbacks
+// can reenter Go APIs or create further iterators, so remove each entry before
+// invoking it and drain registrations made during cleanup as well.
+func (r *Runtime) closeNativeIterators() {
+	for len(r.nativeIterators) != 0 {
+		var current *goIteratorState
+		for current = range r.nativeIterators {
+			break
+		}
+		current.closeOnAbrupt()
+	}
+	r.nativeIterators = nil
+}
+
+func (r *Runtime) wrapIterSeq(nextFunc reflect.Value) (func(Value) (Value, bool), func()) {
+	n, stop := iter.Pull(nextFunc.Seq())
+	return func(Value) (Value, bool) {
+		val, valid := n()
+		if !valid {
+			return _undefined, false
+		}
+		return r.toValue(val.Interface(), val), true
+	}, stop
+}
+
+func (r *Runtime) wrapIterSeq2(nextFunc reflect.Value) (func(Value) (Value, bool), func()) {
+	n, stop := iter.Pull2(nextFunc.Seq2())
+	if nextFunc.Type().In(0).In(1) == reflectTypeError {
+		return func(Value) (Value, bool) {
+			val, errVal, valid := n()
+			if !valid {
+				return _undefined, false
+			}
+			if !errVal.IsNil() {
+				// nextResult closes the pull iterator while preserving this
+				// primary error if the source's deferred cleanup also panics.
+				err := errVal.Interface().(error)
+				if _, ok := err.(*Exception); ok {
+					panic(err)
+				}
+				if isUncatchableException(err) {
+					panic(err)
+				}
+				panic(r.NewGoError(err))
+			}
+			return r.toValue(val.Interface(), val), true
+		}, stop
+	}
+
+	return func(Value) (Value, bool) {
+		val1, val2, valid := n()
+		if !valid {
+			return _undefined, false
+		}
+		return r.newArrayValues([]Value{r.toValue(val1.Interface(), val1), r.toValue(val2.Interface(), val2)}), true
+	}, stop
+}
+
+func (r *Runtime) newGoIter(next func(Value) (Value, bool), stop func()) *Object {
+	state := &goIteratorState{runtime: r, next: next, stop: stop}
+	i := &goIteratorObject{goIteratorState: state}
+	iterObj := &Object{runtime: r, self: i}
+	i.val = iterObj
+	i.class = classObject
+	i.extensible = true
+	i.prototype = r.global.ObjectPrototype
+	i.init()
+	if stop != nil {
+		if r.nativeIterators == nil {
+			r.nativeIterators = make(map[*goIteratorState]struct{})
+		}
+		r.nativeIterators[state] = struct{}{}
+	}
+	nextFunc := r.newIteratorNextFunc(func(functionCall FunctionCall) Value {
+		value, valid := state.nextResult(nil)
+		return r.createIterResultObject(value, !valid)
+	}, 0, func(*Object) func(Value) (Value, bool) {
+		return state.nextResult
+	})
+	nextFunc.self.(*iteratorNextFunction).nativeStop = state.closeOnAbrupt
+	iterObj.self.setOwnStr("next", nextFunc, false)
+	if stop != nil {
+		iterObj.self.setOwnStr("return", r.ToValue(func(call FunctionCall) Value {
+			state.close()
+			return r.createIterResultObject(call.Argument(0), true)
+		}), false)
+	}
+	return iterObj
+}
+
+func (r *Runtime) getGoFuncIterator(fn reflect.Value) func(FunctionCall) Value {
+	typ := fn.Type()
+	if typ.CanSeq() {
+		return func(FunctionCall) Value {
+			return r.newGoIter(r.wrapIterSeq(fn))
+		}
+	}
+	if typ.CanSeq2() {
+		return func(FunctionCall) Value {
+			return r.newGoIter(r.wrapIterSeq2(fn))
+		}
+	}
+	return nil
 }
 
 func (r *Runtime) getIterator(obj Value, method func(FunctionCall) Value) *iteratorRecord {
 	if method == nil {
 		method = toMethod(r.getV(obj, SymIterator))
+	}
+	if method != nil {
+		iter := r.toObject(method(FunctionCall{
+			This: obj,
+		}))
+
+		return r.getIteratorDirect(iter)
+	}
+
+	panic(r.NewTypeError("object is not iterable"))
+}
+
+func (r *Runtime) getOptionalIterator(obj Value, method func(FunctionCall) Value) (ir *iteratorRecord, err error) {
+	err = r.try(func() {
 		if method == nil {
-			panic(r.NewTypeError("object is not iterable"))
+			method = toMethod(r.getV(obj, SymIterator))
 		}
-	}
+		if method != nil {
+			iter := r.toObject(method(FunctionCall{
+				This: obj,
+			}))
 
-	iter := r.toObject(method(FunctionCall{
-		This: obj,
-	}))
-
-	var next func(FunctionCall) Value
-
-	if obj, ok := iter.self.getStr("next", nil).(*Object); ok {
-		if call, ok := obj.self.assertCallable(); ok {
-			next = call
+			ir = r.getIteratorDirect(iter)
 		}
+	})
+	return
+}
+
+func (r *Runtime) getAsyncIterator(obj Value) *iteratorRecord {
+	if method := toMethod(r.getV(obj, SymAsyncIterator)); method != nil {
+		return r.getIterator(obj, method)
+	}
+	return r.createAsyncFromSyncIterator(r.getIterator(obj, nil))
+}
+
+// createAsyncFromSyncIterator implements CreateAsyncFromSyncIterator. The iterator object is only accessible
+// by for-await, so it only needs a 'return' method, 'next' is stored in the record.
+func (r *Runtime) createAsyncFromSyncIterator(syncIter *iteratorRecord) *iteratorRecord {
+	// AsyncFromSyncIteratorContinuation. Closing the sync iterator on rejection ignores any errors from return().
+	continuation := func(result *Object, pcap *promiseCapability, closeOnRejection bool) {
+		done := iteratorComplete(result)
+		value := iteratorValue(result)
+		closeOnRejection = closeOnRejection && !done
+		var valueWrapper *Object
+		if ex := r.vm.try(func() {
+			valueWrapper = r.promiseResolve(r.getPromise(), value)
+		}); ex != nil {
+			if closeOnRejection {
+				_ = r.vm.try(syncIter.returnIter)
+			}
+			panic(ex)
+		}
+		onFulfilled := r.newNativeFunc(func(call FunctionCall) Value {
+			return r.createIterResultObject(call.Argument(0), done)
+		}, "", 1)
+		var onRejected Value = _undefined
+		if closeOnRejection {
+			onRejected = r.newNativeFunc(func(call FunctionCall) Value {
+				_ = r.vm.try(syncIter.returnIter)
+				panic(call.Argument(0))
+			}, "", 1)
+		}
+		r.performPromiseThen(valueWrapper.self.(*Promise), onFulfilled, onRejected, pcap)
 	}
 
-	return &iteratorRecord{
-		iterator: iter,
-		next:     next,
+	next := func(FunctionCall) Value {
+		pcap := r.newPromiseCapability(r.getPromise())
+		pcap.try(func() {
+			if syncIter.next == nil {
+				panic(r.NewTypeError("iterator.next is not a function"))
+			}
+			continuation(r.toObject(syncIter.next(FunctionCall{This: syncIter.iterator})), pcap, true)
+		})
+		return pcap.promise
 	}
+	ret := func(FunctionCall) Value {
+		pcap := r.newPromiseCapability(r.getPromise())
+		pcap.try(func() {
+			if method := toMethod(syncIter.iterator.self.getStr("return", nil)); method != nil {
+				continuation(r.toObject(method(FunctionCall{This: syncIter.iterator})), pcap, false)
+			} else {
+				pcap.resolve(r.createIterResultObject(_undefined, true))
+			}
+		})
+		return pcap.promise
+	}
+	iter := r.NewObject()
+	iter.self._putProp("return", r.newNativeFunc(ret, "return", 0), true, false, true)
+	return &iteratorRecord{iterator: iter, next: next, nativeStop: syncIter.closeNative}
 }
 
 func iteratorComplete(iterResult *Object) bool {
@@ -2870,9 +3338,7 @@ func iteratorValue(iterResult *Object) Value {
 }
 
 func isJsException(x interface{}) bool {
-	if asUncatchableException(x) != nil {
-		return false
-	}
+	// Match exceptionFromValue's actual catchable representations.
 	switch x.(type) {
 	case Value, *Exception, typeError, referenceError, rangeError, syntaxError:
 		return true
@@ -2882,16 +3348,23 @@ func isJsException(x interface{}) bool {
 }
 
 func (ir *iteratorRecord) iterate(step func(Value)) {
+	defer func() {
+		if x := recover(); x != nil {
+			if !isJsException(x) {
+				ir.closeNative()
+			}
+			panic(x)
+		}
+	}()
 	r := ir.iterator.runtime
 	for {
 		if ir.next == nil {
 			panic(r.NewTypeError("iterator.next is missing or not a function"))
 		}
-		res := r.toObject(ir.next(FunctionCall{This: ir.iterator}))
-		if iteratorComplete(res) {
+		value, valid := ir.stepValue()
+		if !valid {
 			break
 		}
-		value := iteratorValue(res)
 		ret := tryFunc(func() {
 			step(value)
 		})
@@ -2909,11 +3382,10 @@ func (ir *iteratorRecord) iterate(step func(Value)) {
 func (ir *iteratorRecord) step() (value Value, ex *Exception) {
 	r := ir.iterator.runtime
 	ex = r.vm.try(func() {
-		res := r.toObject(ir.next(FunctionCall{This: ir.iterator}))
-		done := iteratorComplete(res)
-		if !done {
-			value = iteratorValue(res)
-		} else {
+		var valid bool
+		value, valid = ir.stepValue()
+		if !valid {
+			value = nil
 			ir.close()
 		}
 	})
@@ -2930,11 +3402,13 @@ func (ir *iteratorRecord) returnIter() {
 	}
 	ir.iterator = nil
 	ir.next = nil
+	ir.nextRes = nil
 }
 
 func (ir *iteratorRecord) close() {
 	ir.iterator = nil
 	ir.next = nil
+	ir.nextRes = nil
 }
 
 // ForOf is a Go equivalent of for-of loop. The function panics if an exception is thrown at any point
@@ -2943,7 +3417,19 @@ func (ir *iteratorRecord) close() {
 // When using outside of Runtime.Run (i.e. when calling directly from Go code, not from a JS function implemented
 // in Go) it must be enclosed in Try. See the example.
 func (r *Runtime) ForOf(iterable Value, step func(curValue Value) (continueIteration bool)) {
-	iter := r.getIterator(iterable, nil)
+	r.forOfMethod(iterable, nil, step)
+}
+
+func (r *Runtime) forOfMethod(iterable Value, method func(FunctionCall) Value, step func(curValue Value) (continueIteration bool)) {
+	iter := r.getIterator(iterable, method)
+	defer func() {
+		if x := recover(); x != nil {
+			if !isJsException(x) {
+				iter.closeNative()
+			}
+			panic(x)
+		}
+	}()
 	for {
 		value, ex := iter.step()
 		if ex != nil {
@@ -2995,10 +3481,6 @@ func (r *Runtime) takePromiseJob() func() {
 
 // called when the top level function returns normally (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
-	// A hook may complete a nested abrupt cleanup and reset leavingAbrupt.
-	// Remember its completion so no queued job is executed by this leave once
-	// ownership of the queue passed to that cleanup.
-	abruptLeaves := r.abruptLeaves
 	defer func() {
 		if len(r.jobQueue) == 0 && !r.leavingAbrupt {
 			r.jobQueue = nil
@@ -3009,7 +3491,7 @@ func (r *Runtime) leave() {
 	for len(r.jobQueue) > 0 {
 		// A reentrant cleanup must not consume or discard the outer
 		// abrupt leave's pending work.
-		if r.leavingAbrupt || r.abruptLeaves != abruptLeaves {
+		if r.leavingAbrupt {
 			return
 		}
 		if r.vm.isAborted() {
@@ -3036,7 +3518,7 @@ func (r *Runtime) leaveAbrupt() {
 }
 
 // leaveAbruptInternal transfers pending jobs without executing them. When
-// preserveInterrupt is set (a catchable native panic), the ordinary interrupt
+// preserveInterrupt is set (a native panic), the ordinary interrupt
 // flag set by native code is left intact; only an uncatchable exit clears it.
 func (r *Runtime) leaveAbruptInternal(preserveInterrupt bool) {
 	// Nested calls (from RunPromiseJob's error path inside a hook)
@@ -3056,7 +3538,6 @@ func (r *Runtime) leaveAbruptInternal(preserveInterrupt bool) {
 	r.leavingAbrupt = true
 	defer func() {
 		r.leavingAbrupt = false
-		r.abruptLeaves++
 		// in a defer so cleanup still runs if hook(job) panics
 		r.jobQueue = nil
 		r.promiseJobQueuePriority = false
@@ -3068,17 +3549,21 @@ func (r *Runtime) leaveAbruptInternal(preserveInterrupt bool) {
 		}
 	}()
 
-	hook := r.promiseJobEnqueuer
-	for len(r.jobQueue) > 0 {
-		// A hook may remove itself mid-cleanup (for example to stop callback
-		// admission). Keep using the cleanup's hook for jobs already queued so
-		// work it enqueued is handed off instead of silently discarded.
+	for {
+		// A forwarding hook can create another suspended native iterator.
+		// Stop it before testing queue emptiness: its Go cleanup may itself
+		// settle a promise and add another job that still needs handoff.
+		if len(r.nativeIterators) != 0 && r.vm.isAborted() {
+			r.closeNativeIterators()
+		}
+		if len(r.jobQueue) == 0 {
+			break
+		}
+		// Removal takes effect immediately, just as on normal exit. Never
+		// resurrect a replaced hook during teardown.
 		current := r.promiseJobEnqueuer
 		if current == nil {
-			if hook == nil {
-				break
-			}
-			current = hook
+			break
 		}
 		r.promiseJobQueuePriority = true
 		job := r.takePromiseJob()
@@ -3198,7 +3683,7 @@ func (r *Runtime) trackPromiseRejection(p *Promise, operation PromiseRejectionOp
 }
 
 func (r *Runtime) callJobCallback(job *jobCallback, this Value, args ...Value) Value {
-	return job.callback(FunctionCall{This: this, Arguments: args})
+	return job.callback(FunctionCall{This: nilSafe(this), Arguments: args})
 }
 
 func (r *Runtime) invoke(v Value, p unistring.String, args ...Value) Value {
@@ -3282,6 +3767,9 @@ func strToInt32(s unistring.String) (int32, bool) {
 		s = s[1:]
 	}
 	l := len(s)
+	if l == 0 {
+		return -1, false
+	}
 	if s[0] == '0' {
 		if l == 1 {
 			return 0, !neg
@@ -3339,6 +3827,9 @@ func strToInt64(s unistring.String) (int64, bool) {
 		s = s[1:]
 	}
 	l := len(s)
+	if l == 0 {
+		return -1, false
+	}
 	if s[0] == '0' {
 		if l == 1 {
 			return 0, !neg
@@ -3460,5 +3951,24 @@ func (r *Runtime) getPrototypeFromCtor(newTarget, defCtor, defProto *Object) *Ob
 	if obj, ok := proto.(*Object); ok {
 		return obj
 	}
+	r.checkFunctionRealm(newTarget)
 	return defProto
+}
+
+// checkFunctionRealm performs the checks of GetFunctionRealm(). There is only one realm, so the only
+// thing left to do is to throw a TypeError if a revoked Proxy is found.
+func (r *Runtime) checkFunctionRealm(obj *Object) {
+	for {
+		switch o := obj.self.(type) {
+		case *boundFuncObject:
+			obj = o.wrapped
+		case *proxyObject:
+			if o.handler == nil {
+				panic(r.NewTypeError("Cannot perform 'GetFunctionRealm' on a proxy that has been revoked"))
+			}
+			obj = o.target
+		default:
+			return
+		}
+	}
 }

@@ -11,7 +11,7 @@ performance.
 
 This project was largely inspired by [otto](https://github.com/robertkrimen/otto).
 
-The minimum required Go version is 1.25.
+The minimum required Go version is 1.26.
 
 Features
 --------
@@ -32,15 +32,6 @@ surrogate pairs, for example:
 
 ```javascript
 JSON.parse(`"\\uD800"`).charCodeAt(0).toString(16) // returns "fffd" instead of "d800"
-```
-
-### Date
-Conversion from calendar date to epoch timestamp uses the standard Go library which uses `int`, rather than `float` as per
-ECMAScript specification. This means if you pass arguments that overflow int to the `Date()` constructor or  if there is
-an integer overflow, the result will be incorrect, for example:
-
-```javascript
-Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740) // returns 29256 instead of 29312
 ```
 
 FAQ
@@ -222,7 +213,25 @@ See [Runtime.ToValue()](https://pkg.go.dev/github.com/joeycumines/goja#Runtime.T
 Regular Expressions
 -------------------
 
-Goja uses the embedded Go regexp library where possible, otherwise it falls back to [regexp2](https://github.com/dlclark/regexp2).
+Goja uses [regexp2](https://github.com/dlclark/regexp2) library. There are a few known incompatibilities, but they are 
+mostly edge cases and should not affect general usage. See tc39_test.go for the list of exclusions. Any new
+incompatibilities should be reported as bugs.
+
+Matching may backtrack for an exponential amount of time. Hosts can opt into
+`Runtime.SetRegexpTimeLimit(duration)` to make an excessively long search throw
+a catchable JavaScript `RangeError`. The default is zero (unlimited); supported
+limits are zero through 24 hours. The limit is local to a runtime and affects
+existing RegExp objects without changing other runtimes that share a compiled
+Program. A private matcher is compiled lazily when a limit is first needed.
+
+This is an approximate budget for each search for the next match. It does not
+bound compilation, input conversion, output construction, a complete global
+operation, or a script. The matcher normally checks a clock with 100 ms
+granularity; scheduling can add further delay. A pending `Interrupt` or `Abort`
+takes precedence when matching returns and is also checked between successful
+matches. Neither cancellation method interrupts the middle of a native regexp
+search immediately. JavaScript can catch a timeout and retry, so a match limit
+is not a sandbox or a replacement for the host's overall execution policy.
 
 Exceptions
 ----------
@@ -309,6 +318,18 @@ also stop callback admission and join its native workers. Terminal native
 rejection schedules but never runs JavaScript reactions; jobs already handed to
 a `PromiseJobEnqueuer` remain host-owned and are rejected by `RunPromiseJob`
 with the abort cause.
+
+Suspended Go iterators retain their native source and stop functions until
+exhaustion, explicit return, or cleanup. Terminal abort releases those resources
+at the next runtime-owner boundary, including a subsequent execution attempt;
+`Abort` itself does not run cleanup on its calling goroutine. Cleanup does not
+invoke JavaScript iterator `return` methods. Abandoned native sources can retain
+their own captures until cleanup, so hosts should close iterators promptly.
+
+An explicit `RunPromiseJob` call during an active async-context tracker returns
+`ErrPromiseJobReentry` without running the job. The host retains the job and can
+retry after the current reaction completes. Removing a promise-job enqueuer
+takes effect before the next delivery, including during abrupt cleanup.
 
 After terminal abort, the native rejection function returned by `NewPromise`
 can dispose of a still-pending result even if it has already adopted a thenable.
