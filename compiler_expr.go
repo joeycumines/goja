@@ -3610,6 +3610,9 @@ func (e *compiledAwaitExpression) emitGetter(putOnStack bool) {
 }
 
 func (e *compiledYieldExpression) emitGetter(putOnStack bool) {
+	if e.delegate {
+		e.c.p.hasYieldDelegate = true
+	}
 	if e.arg != nil {
 		e.arg.emitGetter(true)
 	} else {

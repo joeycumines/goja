@@ -70,6 +70,10 @@ type srcMapItem struct {
 type Program struct {
 	code []instruction
 
+	// A yield* may expose the delegated iterator's original IteratorResult.
+	// Such generators cannot use the value-only iterator shortcut.
+	hasYieldDelegate bool
+
 	funcName unistring.String
 	src      *file.File
 	srcMap   []srcMapItem

@@ -394,7 +394,7 @@ func (r *Runtime) createGeneratorProto(val *Object) objectImpl {
 
 	o._putProp("constructor", r.getGeneratorFunctionPrototype(), false, false, true)
 	o._putProp("next", r.newIteratorNextFunc(r.builtin_genproto_next, 1, func(iterator *Object) func(Value) (Value, bool) {
-		if i, ok := iterator.self.(*generatorObject); ok {
+		if i, ok := iterator.self.(*generatorObject); ok && !i.hasYieldDelegate {
 			return i.nextResult
 		}
 		return nil

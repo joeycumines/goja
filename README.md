@@ -303,6 +303,18 @@ rejection schedules but never runs JavaScript reactions; jobs already handed to
 a `PromiseJobEnqueuer` remain host-owned and are rejected by `RunPromiseJob`
 with the abort cause.
 
+Suspended Go iterators retain their native source and stop functions until
+exhaustion, explicit return, or cleanup. Terminal abort releases those resources
+at the next runtime-owner boundary, including a subsequent execution attempt;
+`Abort` itself does not run cleanup on its calling goroutine. Cleanup does not
+invoke JavaScript iterator `return` methods. Abandoned native sources can retain
+their own captures until cleanup, so hosts should close iterators promptly.
+
+An explicit `RunPromiseJob` call during an active async-context tracker returns
+`ErrPromiseJobReentry` without running the job. The host retains the job and can
+retry after the current reaction completes. Removing a promise-job enqueuer
+takes effect before the next delivery, including during abrupt cleanup.
+
 After terminal abort, the native rejection function returned by `NewPromise`
 can dispose of a still-pending result even if it has already adopted a thenable.
 It preserves completed results and does not change ordinary `Interrupt` behavior.

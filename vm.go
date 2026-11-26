@@ -900,6 +900,42 @@ func unwrapDestructSource(f *Object) *Object {
 	return nil
 }
 
+// stackNameBase exposes only ordinary stored properties and the stored
+// prototype. It deliberately bypasses virtual property access: getOwnPropStr
+// can call a DynamicObject handler or convert a wrapped Go value.
+func (o *baseObject) stackNameBase() *baseObject {
+	return o
+}
+
+func stackNameData(obj objectImpl) (name Value, prototype *Object, ok bool) {
+	var tmpl *templatedObject
+	switch o := obj.(type) {
+	case *proxyObject, *dynamicObject, *dynamicArray, *objectGoMapSimple, reflectValueWrapper:
+		// Host and exotic property lookup is not a safe diagnostic operation.
+		return nil, nil, false
+	case *templatedObject:
+		tmpl = o
+	case *templatedFuncObject:
+		tmpl = &o.templatedObject
+	case *templatedArrayObject:
+		tmpl = &o.templatedObject
+	}
+	if tmpl != nil {
+		// These are runtime-owned templates, not host property callbacks.
+		// Materialise a lazy built-in name, and its prototype only if needed.
+		name = tmpl.getOwnPropStr("name")
+		if name == nil {
+			tmpl.materialiseProto()
+		}
+		return name, tmpl.prototype, true
+	}
+	if o, ok := obj.(interface{ stackNameBase() *baseObject }); ok {
+		base := o.stackNameBase()
+		return base.values["name"], base.prototype, true
+	}
+	return nil, nil, false
+}
+
 func getFuncName(stack []Value, sb int) unistring.String {
 	if sb > 0 && sb <= len(stack) {
 		if f, ok := stack[sb-1].(*Object); ok && f != nil {
@@ -921,26 +957,28 @@ func getFuncName(stack []Value, sb int) unistring.String {
 			// prototype chain explicitly so inherited function names still
 			// appear in stack frames without invoking getters or proxies.
 			var name Value
-			for current := f; current != nil; {
+			for current, depth := f, 0; current != nil && depth < 1024; depth++ {
 				current = unwrapDestructSource(current)
 				if current == nil || current.self == nil {
 					break
 				}
-				if _, isProxy := current.self.(*proxyObject); isProxy {
+				candidate, prototype, ok := stackNameData(current.self)
+				if !ok {
 					break
 				}
-				candidate := current.self.getOwnPropStr("name")
+				present := candidate != nil
 				if prop, ok := candidate.(*valueProperty); ok {
 					if prop.accessor || prop.getterFunc != nil || prop.setterFunc != nil {
 						break
 					}
 					candidate = prop.value
 				}
-				if candidate != nil && candidate != _undefined {
+				if present {
+					// An own nil or undefined value still shadows inherited properties.
 					name = candidate
 					break
 				}
-				current = current.self.proto()
+				current = prototype
 			}
 			// Only side-effect-free primitives may be formatted; *Object
 			// runs user coercion/Proxy traps and *Symbol throws TypeError.
@@ -1029,11 +1067,20 @@ func (vm *vm) popTryFrame() {
 }
 
 func (vm *vm) discardStacks(iterLen, refLen uint32) {
-	iterTail := vm.iterStack[iterLen:]
-	for i := range iterTail {
-		iterTail[i] = iterStackItem{}
+	for len(vm.iterStack) > int(iterLen) {
+		i := len(vm.iterStack) - 1
+		item := vm.iterStack[i]
+		vm.iterStack[i] = iterStackItem{}
+		vm.iterStack = vm.iterStack[:i]
+		// A discarded frame must release native resources without entering
+		// JavaScript. Detach before cleanup, which can reenter Go APIs.
+		if item.iter != nil {
+			item.iter.closeNative()
+		}
+		if item.aiter != nil {
+			item.aiter.closeNative()
+		}
 	}
-	vm.iterStack = vm.iterStack[:iterLen]
 	refTail := vm.refStack[refLen:]
 	for i := range refTail {
 		refTail[i] = nil
@@ -1044,9 +1091,8 @@ func (vm *vm) discardStacks(iterLen, refLen uint32) {
 func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 	// Restore other stacks
 	defer vm.discardStacks(iterLen, refLen)
-	iterTail := vm.iterStack[iterLen:]
-	for i := len(iterTail) - 1; i >= 0; i-- {
-		if iter := iterTail[i].iter; iter != nil {
+	for i := len(vm.iterStack) - 1; i >= int(iterLen); i-- {
+		if iter := vm.iterStack[i].iter; iter != nil {
 			ex1 := vm.try(func() {
 				iter.returnIter()
 			})
@@ -1054,7 +1100,8 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 				ex = ex1
 			}
 		}
-		iterTail[i] = iterStackItem{}
+		// A return callback may have reallocated iterStack.
+		vm.iterStack[i] = iterStackItem{}
 	}
 	return
 }
@@ -5497,12 +5544,12 @@ func (_asyncIterNext) exec(vm *vm) {
 	if iter.next == nil {
 		panic(vm.r.NewTypeError("iterator.next is not a function"))
 	}
-	vm.stack.expand(vm.sp + 1)
-	vm.stack[vm.sp] = iter.next(FunctionCall{This: iter.iterator})
-	vm.sp++
+	// A native callback may reenter the runtime and restore the stack slice.
+	// Select the destination only after the callback has completed.
+	result := iter.next(FunctionCall{This: iter.iterator})
+	vm.push(result)
 	// await
-	vm.stack[vm.sp] = await
-	vm.sp++
+	vm.push(await)
 	vm.pc = -vm.pc
 }
 
@@ -5526,12 +5573,10 @@ type asyncIterClose int32
 func (jmp asyncIterClose) exec(vm *vm) {
 	iter := vm.iterStack[len(vm.iterStack)-1].aiter
 	if ret := toMethod(iter.iterator.self.getStr("return", nil)); ret != nil {
-		vm.stack.expand(vm.sp + 1)
-		vm.stack[vm.sp] = ret(FunctionCall{This: iter.iterator})
-		vm.sp++
+		result := ret(FunctionCall{This: iter.iterator})
+		vm.push(result)
 		// await
-		vm.stack[vm.sp] = await
-		vm.sp++
+		vm.push(await)
 		vm.pc = -vm.pc
 	} else {
 		vm.pc += int(jmp)

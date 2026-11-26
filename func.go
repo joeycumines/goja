@@ -141,6 +141,9 @@ type nativeFuncObject struct {
 type iteratorNextFunction struct {
 	nativeFuncObject
 	getNextResult func(this *Object) func(Value) (Value, bool)
+	// A bound Go next method retains its resource owner even when borrowed
+	// by a different iterator object.
+	nativeStop func()
 }
 
 type wrappedFuncObject struct {
@@ -166,9 +169,10 @@ const (
 
 type generatorObject struct {
 	baseObject
-	gen       generator
-	delegated *iteratorRecord
-	state     generatorState
+	gen              generator
+	delegated        *iteratorRecord
+	state            generatorState
+	hasYieldDelegate bool
 }
 
 func (f *nativeFuncObject) source() String {
@@ -1033,11 +1037,35 @@ func (g *generatorObject) validate() {
 
 func (g *generatorObject) completeOnPanic() {
 	if x := recover(); x != nil {
+		if !isJsException(x) {
+			g.closeNative()
+		}
 		g.state = genStateCompleted
 		g.delegated = nil
 		g.gen.ctx = execCtx{}
 		g.gen.returning = nil
 		panic(x)
+	}
+}
+
+func (g *generatorObject) closeNative() {
+	delegated, stack := g.delegated, g.gen.ctx.iterStack
+	g.state = genStateCompleted
+	g.delegated = nil
+	g.gen.ctx = execCtx{}
+	g.gen.returning = nil
+	if delegated != nil {
+		delegated.closeNative()
+	}
+	for i := len(stack) - 1; i >= 0; i-- {
+		item := stack[i]
+		stack[i] = iterStackItem{}
+		if item.iter != nil {
+			item.iter.closeNative()
+		}
+		if item.aiter != nil {
+			item.aiter.closeNative()
+		}
 	}
 }
 
@@ -1148,6 +1176,7 @@ func (g *generatorObject) callDelegated(method func(FunctionCall) Value, v Value
 
 func (g *generatorObject) nextResult(v Value) (Value, bool) {
 	g.validate()
+	defer g.completeOnPanic()
 	if g.state == genStateCompleted {
 		return _undefined, false
 	}
@@ -1301,6 +1330,7 @@ func (f *baseJsFuncObject) generatorCall(vmCall func(*vm, int), nArgs int) Value
 			val:        o,
 			extensible: true,
 		},
+		hasYieldDelegate: f.prg.hasYieldDelegate,
 	}
 	o.self = genObj
 	genObj.init(vmCall, nArgs)

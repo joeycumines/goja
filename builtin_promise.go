@@ -845,17 +845,17 @@ func (r *Runtime) wrapPromiseReaction(p *Promise, fObj *Object, rejecting bool) 
 // PromiseJobEnqueuer still receives the resulting reaction jobs; the host owns
 // their execution and RunPromiseJob rejects them with the abort cause.
 func (r *Runtime) rejectAbortedPromise(p *Promise, x interface{}) (err error) {
-	if p.state != PromiseStatePending {
-		return nil
-	}
 	vm := r.vm
 	frame := vm.saveExecutionFrame()
+	ownsQueue := frame.callStackLen == 0 && r.nativeCallDepth == 0
+	r.nativeCallDepth++
+	defer func() { r.nativeCallDepth-- }()
 	defer func() {
 		// A direct native-to-JavaScript call can alter registers such as pc
 		// before pushing its own context. Restore the entire caller context,
 		// not only the stacks restored by the try frame.
 		vm.restoreExecutionFrame(frame)
-		if frame.callStackLen == 0 && !r.asyncTrackerActive && !r.leavingAbrupt {
+		if ownsQueue && !r.asyncTrackerActive && !r.leavingAbrupt {
 			// No runWrapped/leave boundary owns this native cleanup. Forward
 			// any retained jobs without executing them and clear VM scratch
 			// state, including tails left by a callback's direct Value API.
@@ -871,6 +871,9 @@ func (r *Runtime) rejectAbortedPromise(p *Promise, x interface{}) (err error) {
 			}
 		}
 	}()
+	if p.state != PromiseStatePending {
+		return nil
+	}
 	// Host callbacks can enter the interpreter through direct Value/Object
 	// APIs. A try frame restores their caller's context on both catchable
 	// exceptions and terminal interruption before the recovery above runs.

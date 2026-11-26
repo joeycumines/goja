@@ -23,7 +23,20 @@ type iteratorHelperObject struct {
 	step       func() (value Value, ok bool)
 	// abort, if set, replaces the default closing of the underlying iterator in return().
 	abort func()
-	state iteratorHelperState
+	// nativeStop, if set, releases all underlying native iterator resources
+	// after an uncatchable exit, without invoking JavaScript return methods.
+	nativeStop func()
+	state      iteratorHelperState
+}
+
+func (h *iteratorHelperObject) closeNative() {
+	h.state = iteratorHelperCompleted
+	if stop := h.nativeStop; stop != nil {
+		h.nativeStop = nil
+		stop()
+	} else if h.underlying != nil {
+		h.underlying.closeNative()
+	}
 }
 
 func (h *iteratorHelperObject) nextResult(_ Value) (Value, bool) {
@@ -36,6 +49,13 @@ func (h *iteratorHelperObject) nextResult(_ Value) (Value, bool) {
 	}
 	h.state = iteratorHelperExecuting
 	defer func() {
+		if x := recover(); x != nil {
+			h.state = iteratorHelperCompleted
+			if !isJsException(x) {
+				h.closeNative()
+			}
+			panic(x)
+		}
 		if h.state == iteratorHelperExecuting {
 			h.state = iteratorHelperCompleted
 		}
@@ -107,19 +127,38 @@ func (r *Runtime) newIteratorHelper(underlying *iteratorRecord, step func() (Val
 func (r *Runtime) getIteratorDirect(obj *Object) *iteratorRecord {
 	var next func(FunctionCall) Value
 	var nextRes func(Value) (Value, bool)
+	nativeStop := nativeIteratorStop(obj)
 	if nextObj, ok := obj.self.getStr("next", nil).(*Object); ok {
 		if call, ok := nextObj.self.assertCallable(); ok {
 			next = call
 			if nf, ok := nextObj.self.(*iteratorNextFunction); ok {
 				nextRes = nf.getNextResult(obj)
+				if nf.nativeStop != nil {
+					nativeStop = nf.nativeStop
+				}
 			}
 		}
 	}
 	return &iteratorRecord{
-		iterator: obj,
-		next:     next,
-		nextRes:  nextRes,
+		iterator:   obj,
+		next:       next,
+		nextRes:    nextRes,
+		nativeStop: nativeStop,
 	}
+}
+
+func nativeIteratorStop(obj *Object) func() {
+	switch i := obj.self.(type) {
+	case *goIteratorObject:
+		return i.goIteratorState.closeOnAbrupt
+	case *generatorObject:
+		return i.closeNative
+	case *iteratorHelperObject:
+		return i.closeNative
+	case *wrapForValidIteratorObject:
+		return i.iterated.closeNative
+	}
+	return nil
 }
 
 func (r *Runtime) getIteratorFlattenable(obj Value, iterateStrings bool) *iteratorRecord {
@@ -170,10 +209,17 @@ func (ir *iteratorRecord) stepDone() bool {
 func closeIterators(iters []*iteratorRecord, ex interface{}) {
 	for i := len(iters) - 1; i >= 0; i-- {
 		if iter := iters[i]; iter != nil {
-			if ex != nil {
-				_ = tryFunc(iter.returnIter)
-			} else {
-				ex = tryFunc(iter.returnIter)
+			if ex != nil && !isJsException(ex) {
+				iter.closeNative()
+				continue
+			}
+			if closeEx := tryFunc(iter.returnIter); closeEx != nil {
+				if !isJsException(closeEx) {
+					iter.closeNative()
+					ex = closeEx
+				} else if ex == nil {
+					ex = closeEx
+				}
 			}
 		}
 	}
@@ -185,8 +231,7 @@ func closeIterators(iters []*iteratorRecord, ex interface{}) {
 // closeOnThrow runs f and, if it throws, closes the iterator (ignoring any error from return()) before rethrowing.
 func (ir *iteratorRecord) closeOnThrow(f func()) {
 	if ex := tryFunc(f); ex != nil {
-		_ = tryFunc(ir.returnIter)
-		panic(ex)
+		closeIterators([]*iteratorRecord{ir}, ex)
 	}
 }
 
@@ -214,7 +259,7 @@ func (r *Runtime) iteratorWithCallback(call FunctionCall, method string) (*itera
 			return r.getIteratorDirect(thisObj), callback
 		}
 	}
-	(&iteratorRecord{iterator: thisObj}).closeOnThrow(func() {
+	(&iteratorRecord{iterator: thisObj, nativeStop: nativeIteratorStop(thisObj)}).closeOnThrow(func() {
 		panic(r.NewTypeError("%s is not a function", arg.String()))
 	})
 	return nil, nil
@@ -222,7 +267,7 @@ func (r *Runtime) iteratorWithCallback(call FunctionCall, method string) (*itera
 
 // iteratorLimit validates the argument of take() and drop(), closing the receiver on failure.
 func (r *Runtime) iteratorLimit(thisObj *Object, arg Value) float64 {
-	iterated := &iteratorRecord{iterator: thisObj}
+	iterated := &iteratorRecord{iterator: thisObj, nativeStop: nativeIteratorStop(thisObj)}
 	var limit float64
 	iterated.closeOnThrow(func() {
 		limit = arg.ToNumber().ToFloat()
@@ -294,7 +339,7 @@ func (r *Runtime) iteratorProto_drop(call FunctionCall) Value {
 			if !math.IsInf(remaining, 1) {
 				remaining--
 			}
-			if _, valid := iterated.stepValue(); !valid {
+			if iterated.stepDone() {
 				return nil, false
 			}
 		}
@@ -335,6 +380,12 @@ func (r *Runtime) iteratorProto_flatMap(call FunctionCall) Value {
 			iterated.closeOnThrow(inner.returnIter)
 		}
 		iterated.returnIter()
+	}
+	h.nativeStop = func() {
+		if inner != nil {
+			inner.closeNative()
+		}
+		iterated.closeNative()
 	}
 	return h.val
 }
@@ -533,6 +584,11 @@ func (r *Runtime) iterator_concat(call FunctionCall) Value {
 			inner.returnIter()
 		}
 	}
+	h.nativeStop = func() {
+		if inner != nil {
+			inner.closeNative()
+		}
+	}
 	return h.val
 }
 
@@ -644,6 +700,13 @@ func (r *Runtime) iteratorZip(iters []*iteratorRecord, mode iteratorZipMode, pad
 	})
 	h.abort = func() {
 		closeIterators(iters, nil)
+	}
+	h.nativeStop = func() {
+		for i := len(iters) - 1; i >= 0; i-- {
+			if iter := iters[i]; iter != nil {
+				iter.closeNative()
+			}
+		}
 	}
 	return h.val
 }
